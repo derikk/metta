@@ -42,7 +42,6 @@ def main(cfg: DictConfig):
     logger = logging.getLogger("metta.tools.sim")
     logger.info(f"Sim job config: {OmegaConf.to_yaml(cfg, resolve=True)}")
     sim_job = SimJob(cfg.sim_job)
-    assert isinstance(sim_job, SimJob)
     with WandbContext(cfg) as wandb_run:
         for policy_uri in sim_job.policy_uris:
             simulate_policy(sim_job, policy_uri, cfg, wandb_run)

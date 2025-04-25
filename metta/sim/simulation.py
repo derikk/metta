@@ -1,9 +1,27 @@
-import logging
-import time
-from datetime import datetime
+"""
+Unified simulation driver for MettaGrid.
 
+* `simulate()` – batch evaluation / training, *or* single-env run that can
+                 emit a compressed replay (local file *or* S3 URI).
+* `play()`     – interactive GUI session (Raylib).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import tempfile
+import time
+import zlib
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urlparse
+
+import boto3
 import numpy as np
 import torch
+import wandb
 from omegaconf import OmegaConf
 
 from metta.agent.policy_store import PolicyRecord, PolicyStore
@@ -16,171 +34,250 @@ logger = logging.getLogger(__name__)
 
 
 class Simulation:
-    """
-    A simulation is any process of steping through a Mettagrid environment.
-    Simulations configure things likes how the policies are mapped to the a
-    agents, as well as which environments to run in.
+    def __init__(
+        self,
+        cfg: SimulationConfig,
+        policy_pr: PolicyRecord,
+        policy_store: Optional[PolicyStore] = None,
+        name: str = "",
+        *,
+        wandb_run=None,
+        render_mode: Optional[str] = None,  # use "human" for GUI play
+    ):
+        self.cfg = cfg
+        self.name = name
+        self.device = cfg.device
+        self.wandb_run = wandb_run
 
-    Simulations are used by training, evaluation and (eventually) play+replay.
-    """
+        # Build environment
+        self.env_cfg = config_from_path(cfg.env, cfg.env_overrides)
+        self.vecenv = make_vecenv(
+            self.env_cfg,
+            cfg.vectorization,
+            num_envs=cfg.num_envs,
+            render_mode=render_mode,
+        )
 
-    def __init__(self, config: SimulationConfig, policy_pr: PolicyRecord, policy_store: PolicyStore, name: str = ""):
-        self._config = config
-        # TODO: Replace with typed EnvConfig
-        self._env_cfg = config_from_path(config.env, config.env_overrides)
-        self._env_name = config.env
+        # Single-env invariant for play / replay
+        if cfg.replay_path or render_mode == "human":
+            assert cfg.num_envs == cfg.num_episodes == 1, "Play / replay require num_envs = num_episodes = 1"
 
-        self._npc_policy_uri = config.npc_policy_uri
-        self._policy_agents_pct = config.policy_agents_pct
-        self._policy_store = policy_store
+        # Candidate policy
+        self.policy_pr = policy_pr
+        self.policy = policy_pr.policy()
 
-        self._device = config.device
-
-        self._num_envs = config.num_envs
-        self._min_episodes = config.num_episodes
-        self._max_time_s = config.max_time_s
-
-        # load candidate policy
-        self._policy_pr = policy_pr
-        self._name = name
-        # load npc policy
-        self._npc_pr = None
-        if self._npc_policy_uri is None:
-            self._policy_agents_pct = 1.0
+        # Optional NPC policy
+        if cfg.npc_policy_uri:
+            assert policy_store, "npc_policy_uri needs PolicyStore"
+            self.npc_pr = policy_store.policy(cfg.npc_policy_uri)
+            self.npc_policy = self.npc_pr.policy()
+            share = cfg.policy_agents_pct
         else:
-            self._npc_pr = self._policy_store.policy(self._npc_policy_uri)
+            self.npc_pr = None
+            self.npc_policy = None
+            share = 1.0
 
-        self._agents_per_env = self._env_cfg.game.num_agents
-        self._policy_agents_per_env = max(1, int(self._agents_per_env * self._policy_agents_pct))
-        self._npc_agents_per_env = self._agents_per_env - self._policy_agents_per_env
-        self._total_agents = self._num_envs * self._agents_per_env
+        # Agent index bookkeeping
+        agents = self.env_cfg.game.num_agents
+        self.policy_agents = max(1, int(agents * share))
+        self.npc_agents = agents - self.policy_agents
 
-        self._vecenv = make_vecenv(self._env_cfg, config.vectorization, num_envs=self._num_envs)
+        grid = torch.arange(self.vecenv.num_agents).reshape(cfg.num_envs, agents).to(self.device)
+        self.policy_idx = grid[:, : self.policy_agents].reshape(-1)
+        self.npc_idx = grid[:, self.policy_agents :].reshape(-1) if self.npc_agents else []
 
-        # each index is an agent, and we reshape it into a matrix of num_envs x agents_per_env
-        slice_idxs = (
-            torch.arange(self._vecenv.num_agents).reshape(self._num_envs, self._agents_per_env).to(device=self._device)
-        )
+        # Episode bookkeeping
+        self.completed = 0
+        self.total_rewards = np.zeros(cfg.num_envs * agents)
 
-        self._policy_idxs = slice_idxs[:, : self._policy_agents_per_env].reshape(
-            self._policy_agents_per_env * self._num_envs
-        )
+    # ------------------------------------------------------------------ #
+    # simulate() -- primary API for batch simulation
+    # ------------------------------------------------------------------ #
+    def simulate(self):
+        """
+        Returns nested list of per-agent episode dicts.
 
-        self._npc_idxs = []
-        if self._npc_agents_per_env > 0:
-            self._npc_idxs = slice_idxs[:, self._policy_agents_per_env :].reshape(
-                self._num_envs * self._npc_agents_per_env
+        If `cfg.replay_path` is defined (and we are single-env / episode),
+        writes a compressed replay file.  An *s3://bucket/key* URI uploads
+        automatically and logs a WandB link if `wandb_run` is provided.
+        """
+        capture_replay = self.cfg.replay_path is not None
+        if capture_replay:
+            grid_hist: list[dict] = []
+            env = self.vecenv.envs[0]
+
+        obs, _ = self.vecenv.reset()
+        pol_state = npc_state = None
+        start = time.time()
+        episodes: list = []
+
+        while self.completed < self.cfg.num_episodes and time.time() - start < self.cfg.max_time_s:
+            # choose actions
+            with torch.no_grad():
+                o = torch.as_tensor(obs, device=self.device)
+                pa, *_p = self.policy(o[self.policy_idx], pol_state)
+                pol_state = _p[3]
+
+                if self.npc_policy:
+                    na, *_n = self.npc_policy(o[self.npc_idx], npc_state)
+                    npc_state = _n[3]
+
+            # snapshot grid (pre-step)
+            if capture_replay:
+                self._snap_grid(env, grid_hist)
+
+            # merge / step
+            acts = pa
+            if self.npc_policy:
+                acts = torch.cat(
+                    [
+                        pa.view(self.cfg.num_envs, self.policy_agents, -1),
+                        na.view(self.cfg.num_envs, self.npc_agents, -1),
+                    ],
+                    1,
+                ).reshape(self.vecenv.num_agents, -1)
+
+            obs, rew, done, trunc, infos = self.vecenv.step(acts.cpu().numpy())
+            self.total_rewards += rew
+            self.completed += sum(e.done for e in self.vecenv.envs)
+
+            # episode-level stats
+            meta = flatten_config(OmegaConf.to_container(self.env_cfg.game, resolve=False), parent_key="game")
+            meta.update(
+                eval_name=self.name or "",
+                timestamp=datetime.now().isoformat(),
+                npc=self.npc_pr.uri if self.npc_pr else None,
             )
 
-        self._completed_episodes = 0
-        self._total_rewards = np.zeros(self._total_agents)
-        self._agent_stats = [{} for a in range(self._total_agents)]
+            for env_i, info in enumerate(infos):
+                if "agent_raw" not in info:
+                    continue
+                for a_i, d in enumerate(info["agent_raw"]):
+                    idx = env_i * self.env_cfg.game.num_agents + a_i
+                    d["policy_name"] = self.policy_pr.name if idx in self.policy_idx else self.npc_pr.name
+                    d["episode_reward"] = info["episode_rewards"][a_i].tolist()
+                    d.update(meta)
+                episodes.append(info["agent_raw"])
 
-        # Create mapping from metta.agent index to policy name
-        self._agent_idx_to_policy_name = {}
-        for agent_idx in self._policy_idxs:
-            self._agent_idx_to_policy_name[agent_idx.item()] = self._policy_pr.name
+        # replay output (if requested)
+        if capture_replay:
+            local_file = self._write_replay_file(env, grid_hist, self.cfg.replay_path)
+            if self.cfg.replay_path.startswith("s3://"):
+                self._upload_to_s3_and_log(local_file, self.cfg.replay_path)
 
-        for agent_idx in self._npc_idxs:
-            self._agent_idx_to_policy_name[agent_idx.item()] = self._npc_pr.name
+        self.vecenv.close()
+        return episodes
 
-    def simulate(self):
-        logger.info(
-            f"Simulating {self._name} policy: {self._policy_pr.name} "
-            + f"in {self._env_name} with {self._policy_agents_per_env} agents"
+    # ------------------------------------------------------------------ #
+    # Replay helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _append(seq: list, step: int, val):
+        if not seq or seq[-1][1] != val:
+            seq.append([step, val])
+
+    def _snap_grid(self, env, hist):
+        t = env._c_env.current_timestep()
+        for i, obj in enumerate(env.grid_objects.values()):
+            if len(hist) <= i:
+                hist.append({})
+            for k, v in obj.items():
+                self._append(hist[i].setdefault(k, []), t, v)
+
+    def _write_replay_file(self, env, hist, path):
+        parsed = urlparse(path)
+        local_path = tempfile.mktemp(suffix=".json.z") if parsed.scheme == "s3" else Path(path).expanduser()
+        if parsed.scheme != "s3":
+            Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+
+        data = {
+            "version": 1,
+            "action_names": env.action_names(),
+            "object_types": env.object_type_names(),
+            "map_size": [env.map_width, env.map_height],
+            "num_agents": env.num_agents,
+            "max_steps": env._c_env.current_timestep(),
+            "grid_objects": [{k: v if len(v) > 1 else v[0][1] for k, v in g.items()} for g in hist],
+        }
+        with open(local_path, "wb") as f:
+            f.write(zlib.compress(json.dumps(data).encode("utf-8")))
+        logger.info("Replay written to %s", local_path)
+        return local_path
+
+    def _upload_to_s3_and_log(self, local, s3_uri):
+        parsed = urlparse(s3_uri)
+        bucket = parsed.netloc
+        key = parsed.path.lstrip("/")
+
+        boto3.client("s3").upload_file(
+            Filename=local,
+            Bucket=bucket,
+            Key=key,
+            ExtraArgs={"ContentType": "application/x-compress"},
         )
-        if self._npc_pr is not None:
-            logger.debug(f"Against npc policy: {self._npc_pr.name} with {self._npc_agents_per_env} agents")
+        logger.info("Replay uploaded to s3://%s/%s", bucket, key)
 
-        logger.info(f"Simulation settings: {self._config}")
+        if self.wandb_run:
+            url = f"https://{bucket}.s3.amazonaws.com/{key}"
+            viewer = f"https://metta-ai.github.io/metta/?replayUrl={url}"
+            self.wandb_run.log({"replays/link": wandb.Html(f'<a href="{viewer}">Replay</a>')})
 
-        obs, _ = self._vecenv.reset()
+    # ------------------------------------------------------------------ #
+    # play() – GUI
+    # ------------------------------------------------------------------ #
+    def play(self):
+        """
+        Launches an interative simulation window
+        """
+        from mettagrid.renderer.raylib.raylib_renderer import MettaGridRaylibRenderer
+
+        env = self.vecenv.envs[0]
+        assert self.policy_pr.metadata["action_names"] == env._c_env.action_names(), (
+            "Policy and environment action sets differ"
+        )
+
+        renderer = MettaGridRaylibRenderer(env._c_env, env._env_cfg.game)
+
+        obs, _ = self.vecenv.reset()
         policy_rnn_state = None
-        npc_rnn_state = None
+        rewards = np.zeros(self.vecenv.num_agents)
+        total_rewards = np.zeros(self.vecenv.num_agents)
 
-        game_stats = []
-        start = time.time()
-
-        # set of episodes that parallelize the environments
-        while self._completed_episodes < self._min_episodes and time.time() - start < self._max_time_s:
+        while True:
+            # ── forward policy ─────────────────────────────────────────────
             with torch.no_grad():
-                obs = torch.as_tensor(obs).to(device=self._device)
-                # observavtions that correspond to policy agent
-                my_obs = obs[self._policy_idxs]
+                obs_t = torch.as_tensor(obs).to(device=self.device)
+                actions, _, _, _, policy_rnn_state, _, _, _ = self.policy(obs_t, policy_rnn_state)
+                if actions.dim() == 0:
+                    actions = torch.tensor([actions.item()])
 
-                # Parallelize across opponents
-                policy = self._policy_pr.policy()  # policy to evaluate
-                policy_actions, _, _, _, policy_rnn_state, _, _, _ = policy(my_obs, policy_rnn_state)
+            # ── render frame (exact legacy signature) ─────────────────────
+            renderer.update(
+                actions.cpu().numpy(),
+                obs,
+                rewards,
+                total_rewards,
+                env._c_env.current_timestep(),
+            )
+            renderer.render_and_wait()
+            actions = renderer.get_actions()  # user overrides
 
-                # Iterate opponent policies
-                if self._npc_pr is not None:
-                    npc_obs = obs[self._npc_idxs]
-                    npc_rnn_state = npc_rnn_state
+            # ── step environment ──────────────────────────────────────────
+            obs, rewards, done, trunc, _ = self.vecenv.step(actions)
+            total_rewards += rewards
 
-                    npc_policy = self._npc_pr.policy()
-                    npc_action, _, _, _, npc_rnn_state, _, _, _ = npc_policy(npc_obs, npc_rnn_state)
+            if done.any() or trunc.any():
+                logger.info("Play finished – total rewards: %s", total_rewards)
+                break
 
-            actions = policy_actions
-            if self._npc_agents_per_env > 0:
-                actions = torch.cat(
-                    [
-                        policy_actions.view(self._num_envs, self._policy_agents_per_env, -1),
-                        npc_action.view(self._num_envs, self._npc_agents_per_env, -1),
-                    ],
-                    dim=1,
-                )
-
-            actions = actions.view(self._num_envs * self._agents_per_env, -1)
-
-            obs, rewards, dones, truncated, infos = self._vecenv.step(actions.cpu().numpy())
-
-            self._total_rewards += rewards
-            self._completed_episodes += sum([e.done for e in self._vecenv.envs])
-
-            # Convert the environment configuration to a dictionary and flatten it.
-            game_cfg = OmegaConf.to_container(self._env_cfg.game, resolve=False)
-            flattened_env = flatten_config(game_cfg, parent_key="game")
-            flattened_env["eval_name"] = self._name
-            flattened_env["timestamp"] = datetime.now().isoformat()
-            flattened_env["npc"] = self._npc_policy_uri
-
-            for n in range(len(infos)):
-                if "agent_raw" in infos[n]:
-                    agent_episode_data = infos[n]["agent_raw"]
-                    episode_reward = infos[n]["episode_rewards"]
-                    for agent_i in range(len(agent_episode_data)):
-                        agent_idx = agent_i + n * self._agents_per_env
-
-                        if agent_idx in self._agent_idx_to_policy_name:
-                            agent_episode_data[agent_i]["policy_name"] = self._agent_idx_to_policy_name[
-                                agent_idx
-                            ].replace("file://", "")
-                        else:
-                            agent_episode_data[agent_i]["policy_name"] = "No Name Found"
-                        agent_episode_data[agent_i]["episode_reward"] = episode_reward[agent_i].tolist()
-                        agent_episode_data[agent_i].update(flattened_env)
-
-                    game_stats.append(agent_episode_data)
-        logger.debug(f"Simulation time: {time.time() - start}")
-        self._vecenv.close()
-        return game_stats
+        self.vecenv.close()
 
 
 class SimulationSuite:
-    def __init__(
-        self,
-        config: SimulationSuiteConfig,
-        policy_pr: PolicyRecord,
-        policy_store: PolicyStore,
-    ):
-        logger.debug(f"Building Simulation suite from config:{config}")
-        self._simulations = dict()
-
-        for name, sim_config in config.simulations.items():
-            # Create a Simulation object for each config
-            sim = Simulation(config=sim_config, policy_pr=policy_pr, policy_store=policy_store, name=name)
-            self._simulations[name] = sim
+    def __init__(self, cfg: SimulationSuiteConfig, pr: PolicyRecord, store: PolicyStore, wandb_run=None):
+        self._sims = {
+            n: Simulation(s_cfg, pr, store, name=n, wandb_run=wandb_run) for n, s_cfg in cfg.simulations.items()
+        }
 
     def simulate(self):
-        # Run all simulations and gather results by name
-        return {name: sim.simulate() for name, sim in self._simulations.items()}
+        return {n: s.simulate() for n, s in self._sims.items()}

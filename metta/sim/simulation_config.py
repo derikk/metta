@@ -20,7 +20,7 @@ class SimulationConfig(Config):
     max_time_s: int = 60
     vectorization: str = "serial"
     eval_db_uri: Optional[str] = None
-
+    replay_path: Optional[str] = None      # if set, a compressed JSON replay is written
 
 class SimulationSuiteConfig(SimulationConfig):
     """A suite of named simulations, with suite-level defaults injected."""
