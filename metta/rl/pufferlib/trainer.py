@@ -23,7 +23,7 @@ from metta.rl.pufferlib.profile import Profile
 from metta.rl.pufferlib.trainer_checkpoint import TrainerCheckpoint
 from metta.sim.eval_stats_db import EvalStatsDB
 from metta.sim.eval_stats_logger import EvalStatsLogger
-from metta.sim.replay_helper import ReplayHelper
+from metta.sim.replay_recorder import ReplayHelper
 from metta.sim.simulation import SimulationSuite
 from metta.sim.simulation_config import SimulationConfig, SimulationSuiteConfig
 from metta.sim.vecenv import make_vecenv

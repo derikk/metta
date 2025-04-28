@@ -3,10 +3,13 @@
 import platform
 import webbrowser
 
+import platform
+import webbrowser
+
 import hydra
 
 from metta.agent.policy_store import PolicyStore
-from metta.sim.replay_helper import ReplayHelper
+from metta.sim.simulation import Simulation
 from metta.sim.simulation_config import SimulationConfig
 from metta.util.config import Config, setup_metta_environment
 from metta.util.runtime_configuration import setup_mettagrid_environment
@@ -26,7 +29,9 @@ def main(cfg):
     with WandbContext(cfg) as wandb_run:
         policy_store = PolicyStore(cfg, wandb_run)
         replay_job = ReplayJob(cfg.replay_job)
+        replay_job.sim.replay_path = f"s3://softmax-public/replays/runs/{cfg.run}/replay.json.z"
         policy_record = policy_store.policy(replay_job.policy_uri)
+<<<<<<< HEAD
         replay_helper = ReplayHelper(replay_job.sim, policy_record, wandb_run)
         epoch = policy_record.metadata.get("epoch", 0)
         replay_helper.generate_and_upload_replay(
@@ -39,6 +44,13 @@ def main(cfg):
         # Only on macos open a browser to the replay
         if platform.system() == "Darwin":
             replay_url = f"https://softmax-public.s3.us-east-1.amazonaws.com/replays/{cfg.run}/replay.{epoch}.json.z"
+=======
+
+        sim = Simulation(replay_job.sim, policy_record, policy_store, wandb_run=wandb_run)
+        sim.simulate()
+        if platform.system() == "Darwin":
+            replay_url = f"https://softmax-public.s3.us-east-1.amazonaws.com/replays/runs/{cfg.run}/replay.json.z"
+>>>>>>> 46ba7f78 (cp)
             webbrowser.open(f"https://metta-ai.github.io/metta/?replayUrl={replay_url}")
 
 
