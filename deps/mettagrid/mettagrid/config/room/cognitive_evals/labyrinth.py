@@ -24,7 +24,7 @@ class LabyrinthMaze(Room):
         border_object: str = "wall",
         onlyhearts: bool = False,
     ):
-        super().__init__(border_width=border_width, border_object=border_object)
+        super().__init__(border_thickness=border_width, border_object=border_object)
         self._desired_width, self._desired_height = width, height
         self._corridor_width = corridor_width
         self._agents = agents

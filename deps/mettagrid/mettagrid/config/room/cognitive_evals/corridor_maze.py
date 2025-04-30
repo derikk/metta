@@ -25,7 +25,7 @@ class CorridorMaze(Room):
         Arms alternate left/right, with resources placed at their ends.
         Optionally rotates the maze 90°.
         """
-        super().__init__(border_width=border_width, border_object="wall")
+        super().__init__(border_thickness=border_width, border_object="wall")
         self.width = width
         self.height = height
         self.border_width = border_width

@@ -39,7 +39,7 @@ class BarrierMaze(Room):
         barrier_placement_mode: str = "same",  # "same", "alternating", "doorways"
         barrier_orientation: str = "vertical",  # "vertical" or "horizontal"
     ):
-        super().__init__(border_width=border_width, border_object=border_object)
+        super().__init__(border_thickness=border_width, border_object=border_object)
         self._width = width
         self._height = height
         self._barrier_width = barrier_width

@@ -25,7 +25,7 @@ class RoomWithinRoom(Room):
         agents: int = 1,
         seed=None,
     ):
-        super().__init__(border_width=border_width, border_object=border_object)
+        super().__init__(border_thickness=border_width, border_object=border_object)
         self._overall_width, self._overall_height = width, height
         self._inner_size_min, self._inner_size_max = inner_size_min, inner_size_max
         self._inner_room_gap_min, self._inner_room_gap_max = inner_room_gap_min, inner_room_gap_max

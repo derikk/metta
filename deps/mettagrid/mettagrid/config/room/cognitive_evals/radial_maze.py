@@ -21,7 +21,7 @@ class RadialMaze(Room):
         border_object: str = "wall",
         onlyhearts: bool = False,
     ):
-        super().__init__(border_width=border_width, border_object=border_object)
+        super().__init__(border_thickness=border_width, border_object=border_object)
         self._width, self._height = width, height
         self._radial_params = radial_params
         self._arms = radial_params.get("arms", 4)
