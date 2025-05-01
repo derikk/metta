@@ -192,6 +192,28 @@ class Room:
         """Build this room. Override in subclasses to implement room-specific logic."""
         raise NotImplementedError
 
+    def copy(self):
+        """
+        Create a deep copy of this room.
+
+        Returns:
+            A new Room instance with the same properties as this one
+        """
+        # Create a new room with the same basic properties
+        new_room = Room(
+            inside_width=self.inside_width,
+            inside_height=self.inside_height,
+            border_thickness=self.border_thickness,
+            border_object="",  # We'll copy the grid directly, so no need to add borders
+            labels=self.labels.copy() if self.labels else None,
+        )
+
+        # Copy the grid
+        new_room.grid = np.copy(self.grid)
+
+        # Return the new room
+        return new_room
+
     def mirror(self, axis: str = "horizontal"):
         """Mirror the room along the specified axis.
 
@@ -270,8 +292,15 @@ class Room:
 
         return self
 
-    def render_on_axis(self, ax, title=None):
-        """Render the room on a specific matplotlib axis"""
+    def render_on_axis(self, ax, title=None, color_map=None):
+        """Render the room on a specific matplotlib axis
+
+        Args:
+            ax: The matplotlib axis to render on
+            title: Optional title for the plot
+            color_map: Optional dictionary mapping elements to colors
+        """
+
         import matplotlib.cm as cm
         import matplotlib.patches as mpatches
         from matplotlib.colors import ListedColormap
@@ -280,40 +309,71 @@ class Room:
         unique_elements = set()
         for row in self.grid:
             for cell in row:
-                if cell:  # Only add non-empty cells
-                    unique_elements.add(cell)
+                unique_elements.add(cell)
 
-        # Sort elements for consistent coloring
-        unique_elements = sorted(list(unique_elements))
+        # Set up the color mapping
+        if color_map:
+            # Create a simplified set of categories for elements
+            display_elements = []
 
-        # Create a mapping from elements to integers
-        element_to_int = {elem: i for i, elem in enumerate(unique_elements)}
+            # First add known elements from color_map that appear in the grid
+            for elem in color_map.keys():
+                if elem in unique_elements and elem != "":
+                    display_elements.append(elem)
+
+            # Add UNKNOWN category if there are elements not in color_map
+            unknown_elements = [e for e in unique_elements if e != "" and e not in color_map]
+            if unknown_elements:
+                display_elements.append("UNKNOWN")
+
+            # Add empty string at the end if it exists in the grid
+            if "" in unique_elements:
+                display_elements.append("")
+
+            # Create the color list
+            colors = []
+            missing_fuschia = (1.0, 0.0, 1.0, 1.0)  # Fuschia for UNKNOWN elements
+
+            for elem in display_elements:
+                if elem == "UNKNOWN":
+                    colors.append(missing_fuschia)
+                else:
+                    colors.append(color_map[elem])
+        else:
+            # Without a color map, use the standard approach
+            display_elements = sorted([e for e in unique_elements if e != ""])
+            if "" in unique_elements:
+                display_elements.append("")
+
+            # Generate colors
+            if len(display_elements) <= 20:
+                base_cmap = cm.get_cmap("tab20", 20)
+                colors = [base_cmap(i % 20) for i in range(len(display_elements))]
+            else:
+                base_cmap = cm.get_cmap("hsv")
+                colors = [base_cmap(i / len(display_elements)) for i in range(len(display_elements))]
+
+            # Set empty cell color to white
+            if "" in unique_elements:
+                empty_index = display_elements.index("")
+                colors[empty_index] = (1, 1, 1, 1)  # White for empty cells
+
+        # Create a mapping function that handles the categories
+        def get_element_index(element):
+            if element == "":
+                return display_elements.index("") if "" in display_elements else -1
+            elif element in color_map and color_map:
+                return display_elements.index(element)
+            else:
+                # Handle unknown elements
+                return display_elements.index("UNKNOWN") if "UNKNOWN" in display_elements else -1
 
         # Convert grid to numeric representation
         numeric_grid = np.zeros_like(self.grid, dtype=int)
         for i in range(self.grid.shape[0]):
             for j in range(self.grid.shape[1]):
-                if self.grid[i, j]:
-                    numeric_grid[i, j] = element_to_int.get(self.grid[i, j], 0)
-                else:
-                    # Empty cells get a value one higher than all other elements
-                    numeric_grid[i, j] = len(unique_elements)
-
-        # Add "empty" to our unique elements list
-        unique_elements.append("")
-
-        # Create a colormap with one more color than unique elements
-        if len(unique_elements) <= 20:
-            # Use tab20 which has 20 distinct colors
-            base_cmap = cm.get_cmap("tab20", 20)
-            colors = [base_cmap(i % 20) for i in range(len(unique_elements))]
-        else:
-            # Use hsv which can generate as many colors as needed
-            base_cmap = cm.get_cmap("hsv")
-            colors = [base_cmap(i / len(unique_elements)) for i in range(len(unique_elements))]
-
-        # Make the last color white for empty cells
-        colors[-1] = (1, 1, 1, 1)  # White for empty cells
+                cell_value = self.grid[i, j]
+                numeric_grid[i, j] = get_element_index(cell_value)
 
         # Create custom colormap
         cmap = ListedColormap(colors)
@@ -329,11 +389,11 @@ class Room:
         # Remove major ticks
         ax.tick_params(which="major", bottom=False, left=False, labelbottom=False, labelleft=False)
 
-        # Create legend patches
+        # Create legend patches - use display_elements for consistency
         legend_patches = []
-        for i, elem in enumerate(unique_elements):
+        for i, elem in enumerate(display_elements):
             # Skip empty cells in the legend
-            if i == len(unique_elements) - 1 and elem == "":
+            if elem == "":
                 continue
             patch = mpatches.Patch(color=colors[i], label=elem)
             legend_patches.append(patch)
@@ -350,28 +410,6 @@ class Room:
             if self.labels:
                 ax.set_title(f"Room: {', '.join(self.labels)}")
         ax.set_aspect("equal")
-
-    def copy(self):
-        """
-        Create a deep copy of this room.
-
-        Returns:
-            A new Room instance with the same properties as this one
-        """
-        # Create a new room with the same basic properties
-        new_room = Room(
-            inside_width=self.inside_width,
-            inside_height=self.inside_height,
-            border_thickness=self.border_thickness,
-            border_object="",  # We'll copy the grid directly, so no need to add borders
-            labels=self.labels.copy() if self.labels else None,
-        )
-
-        # Copy the grid
-        new_room.grid = np.copy(self.grid)
-
-        # Return the new room
-        return new_room
 
 
 def main():
@@ -395,26 +433,34 @@ def main():
     chair.fill("chair")
     room.put_random(chair, 3)
 
+    color_map = {
+        "wall": (0.6, 0.3, 0.0, 1.0),  # Brown
+        "floor": (0.9, 0.9, 0.8, 1.0),  # Light beige
+        "table": (0.4, 0.2, 0.0, 1.0),  # Dark brown
+        "chair": (0.2, 0.5, 0.2, 1.0),  # Green
+        "": (1.0, 1.0, 1.0, 1.0),  # White for empty space
+    }
+
     # Create a figure with 2x2 subplots
     fig, axes = plt.subplots(2, 2, figsize=(10, 8))
 
     # Original room (top-left)
-    room.render_on_axis(axes[0, 0], "Original Room")
+    room.render_on_axis(axes[0, 0], "Original Room", color_map)
 
     # 45° rotation (top-right)
     rotated_45 = room.copy()
-    rotated_45.rotate(45)
-    rotated_45.render_on_axis(axes[0, 1], "Rotated 45°")
+    rotated_45.rotate(45, fill_object="wall")
+    rotated_45.render_on_axis(axes[0, 1], "Rotated 45°", color_map)
 
     # 90° rotation (bottom-left)
     rotated_90 = room.copy()
-    rotated_90.rotate(90)
-    rotated_90.render_on_axis(axes[1, 0], "Rotated 90°")
+    rotated_90.rotate(90, fill_object="wall")
+    rotated_90.render_on_axis(axes[1, 0], "Rotated 90°", color_map)
 
     # Mirrored (bottom-right)
     mirrored = room.copy()
     mirrored.mirror(axis="horizontal")
-    mirrored.render_on_axis(axes[1, 1], "Mirrored Horizontally")
+    mirrored.render_on_axis(axes[1, 1], "Mirrored Horizontally", color_map)
 
     plt.tight_layout()
     plt.show()
