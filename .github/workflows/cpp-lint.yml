@@ -1,4 +1,4 @@
-name: cpp-lint
+name: "C++ Lint"
 concurrency:
   group: cpp-lint-${{ github.ref }}-${{ github.run_id }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
@@ -10,9 +10,9 @@ on:
         required: false
         type: string
 
-
 jobs:
   cpp-lint:
+    name: "Lint"
     if: >-
       github.event.pull_request.draft == false || 
       github.event_name == 'workflow_dispatch' || 
@@ -23,16 +23,18 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
-        
+
       # Skip file change check if triggered from cpp-checks workflow
       - name: Check for C++ and Cython file changes
         id: cpp_lint_check_files
         if: github.event_name != 'workflow_call'
         uses: ./.github/actions/file-changes
         with:
-          patterns: 'deps/mettagrid/,*.cpp,*.cxx,*.cc,*.h,*.hpp,*.pyx,*.pxd'
+          patterns: "*.cpp,*.cxx,*.cc,*.h,*.hpp,*.pyx,*.pxd"
+          directory_paths: "mettagrid/"
+          specific_files: "requirements.txt,setup.py"
           github-token: ${{ secrets.GITHUB_TOKEN }}
-      
+
       - name: Set early exit flag
         id: set_early_exit
         run: |
@@ -46,17 +48,17 @@ jobs:
             echo "in all other cases, don't exit early"
             echo "EARLY_EXIT=false" >> $GITHUB_ENV
           fi
-      
+
       - name: Setup C++
         if: env.EARLY_EXIT == 'false'
         uses: ./.github/actions/cpp-setup
-        
+
       - name: Install clang-format
         if: env.EARLY_EXIT == 'false'
         run: |
           sudo apt-get update
           sudo apt-get install -y clang-format
-          
+
       - name: Run clang-format check
         if: env.EARLY_EXIT == 'false'
         run: |
@@ -64,8 +66,8 @@ jobs:
           find . -type f \( -name "*.cpp" -o -name "*.h" -o -name "*.hpp" \) \
             -not -path "*/build/*" -not -path "*/venv/*" \
             -exec clang-format --dry-run --Werror {} +
-            
-      - name: Skip linting (no relevant changes)
+
+      - name: linting skipped (no relevant changes)
         if: env.EARLY_EXIT == 'true'
         run: |
           echo "No C++ files (*.cpp, *.h, *.hpp) were changed. Skipping linting."

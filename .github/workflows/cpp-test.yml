@@ -1,4 +1,4 @@
-name: cpp-test
+name: "C++ Tests"
 concurrency:
   group: cpp-test-${{ github.ref }}-${{ github.run_id }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
@@ -10,9 +10,9 @@ on:
         required: false
         type: string
 
-
 jobs:
   cpp-test:
+    name: "Tests"
     if: >-
       github.event.pull_request.draft == false || 
       github.event_name == 'workflow_dispatch' || 
@@ -23,16 +23,18 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
-        
+
       # Skip file change check if triggered from cpp-checks workflow
       - name: Check for C++ and Cython file changes
         id: cpp_test_check_files
         if: github.event_name != 'workflow_call'
         uses: ./.github/actions/file-changes
         with:
-          patterns: 'deps/mettagrid/,*.cpp,*.cxx,*.cc,*.h,*.hpp,*.pyx,*.pxd'
+          patterns: "*.cpp,*.cxx,*.cc,*.h,*.hpp,*.pyx,*.pxd"
+          directory_paths: "mettagrid/"
+          specific_files: "requirements.txt,setup.py"
           github-token: ${{ secrets.GITHUB_TOKEN }}
-      
+
       - name: Set early exit flag
         id: set_early_exit
         run: |
@@ -46,19 +48,19 @@ jobs:
             echo "in all other cases, don't exit early"
             echo "EARLY_EXIT=false" >> $GITHUB_ENV
           fi
-      
+
       - name: Setup C++
         if: env.EARLY_EXIT == 'false'
         uses: ./.github/actions/cpp-setup
-        
+
       - name: Build and run tests
         if: env.EARLY_EXIT == 'false'
         run: |
-          cd deps/mettagrid
+          cd mettagrid
           make test
-          
-      - name: Skip tests (no relevant changes)
+
+      - name: tests skipped (no relevant changes)
         if: env.EARLY_EXIT == 'true'
         run: |
-          echo "No C++ files in deps/mettagrid were changed. Skipping tests."
+          echo "No C++ files in mettagrid/ were changed. Skipping tests."
           echo "This check passes automatically when no relevant C++ files are changed."
