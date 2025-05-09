@@ -126,7 +126,7 @@ def simulate_policy(
 def fetch_matching_policies(config: FetchPoliciesConfig) -> List[dict]:
     """
     Fetch policies from wandb based on the configured filters.
-    Focuses on finding policies stored as model artifacts in runs.
+    Only processes runs that have model artifacts.
 
     Args:
         config: The FetchPoliciesConfig instance with filtering and sorting options
@@ -175,21 +175,23 @@ def fetch_matching_policies(config: FetchPoliciesConfig) -> List[dict]:
     # Process each run
     for run in runs:
         try:
-            # Check if the run has model artifacts
-            model_artifacts = []
-            print(f"Run {run.name} has {len(run.logged_artifacts())} artifacts")
+            # First check if the run has any artifacts before printing anything
+            artifacts = list(run.logged_artifacts())
 
-            for artifact in run.logged_artifacts():
-                if artifact.type == "model":
-                    print(f"  Artifact {artifact.id} is type {artifact.type}")
-                    model_artifacts.append(artifact)
+            # Filter for only model artifacts
+            model_artifacts = [a for a in artifacts if a.type == "model"]
 
-            # Skip runs with no model artifacts
+            # Skip runs with no model artifacts (and don't print anything)
             if not model_artifacts:
                 continue
 
+            # Only print information for runs with model artifacts
+            print(f"Run {run.name} has {len(model_artifacts)} model artifacts (of {len(artifacts)} total)")
+
             # Process each model artifact
             for artifact in model_artifacts:
+                print(f"  Artifact {artifact.id} is type {artifact.type}, name: {artifact.name}:v{artifact.version}")
+
                 # Create qualified name
                 qualified_name = f"{config.entity}/{config.project}/{artifact.name}:v{artifact.version}"
                 uri = f"wandb://{qualified_name}"
