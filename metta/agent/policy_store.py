@@ -200,6 +200,22 @@ class PolicyRecord:
     def version(self) -> int:
         return self.key_and_version()[1]
 
+    def validate_spaces(self):
+        """Validate observation and action spaces match what was used to train the policy."""
+        # Skip validation for old policies without space information
+        if not all(k in self.metadata for k in ["obs_space_shape", "action_space_shape", "grid_features"]):
+            return True
+
+        if not hasattr(self._policy, "agent_attributes"):
+            return True
+
+        attrs = self._policy.agent_attributes
+        return (
+            self.metadata["obs_space_shape"] == attrs["obs_shape"]
+            and self.metadata["action_space_shape"] == list(attrs["action_space"].nvec)
+            and self.metadata["grid_features"] == attrs["grid_features"]
+        )
+
 
 class PolicyStore:
     def __init__(self, cfg: ListConfig | DictConfig, wandb_run: WandbRun | None):
@@ -338,6 +354,9 @@ class PolicyStore:
                 "epoch": 0,
                 "generation": 0,
                 "train_time": 0,
+                "obs_space_shape": list(env.single_observation_space.shape),
+                "action_space_shape": list(env.single_action_space.shape),
+                "grid_features": env.grid_features,
             },
         )
         pr._policy = policy
@@ -426,15 +445,24 @@ class PolicyStore:
 
     def load_from_uri(self, uri: str) -> PolicyRecord:
         if uri.startswith("wandb://"):
-            return self._load_wandb_artifact(uri[len("wandb://") :])
-        if uri.startswith("file://"):
-            return self._load_from_file(uri[len("file://") :])
-        if uri.startswith("puffer://"):
+            pr = self._load_wandb_artifact(uri[len("wandb://") :])
+        elif uri.startswith("file://"):
+            pr = self._load_from_file(uri[len("file://") :])
+        elif uri.startswith("puffer://"):
             return self._load_from_puffer(uri[len("puffer://") :])
-        if "://" not in uri:
-            return self._load_from_file(uri)
+        elif "://" not in uri:
+            pr = self._load_from_file(uri)
+        else:
+            raise ValueError(f"Invalid URI: {uri}")
 
-        raise ValueError(f"Invalid URI: {uri}")
+        # Validate spaces for non-puffer policies
+        if not pr.validate_spaces():
+            raise ValueError(
+                "Policy was trained with different observation/action spaces. This could mean the environment "
+                "has changed since the policy was trained. Check the metadata of the policy for details."
+            )
+
+        return pr
 
     def _make_codebase_backwards_compatible(self):
         """
