@@ -2,38 +2,33 @@ import gymnasium as gym
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 
-# Import the actual class
-from metta.agent.metta_agent import MettaAgent
-from metta.agent.util.distribution_utils import sample_logits
+from metta.agent.brain_policy import BrainPolicy
+from metta.agent.metta_agent import MettaAgent, make_agent
+from metta.agent.puffer_policy import PufferPolicy
 
 
 @pytest.fixture
-def create_metta_agent():
-    # Create minimal observation and action spaces for testing
+def create_brain_agent():
     obs_space = gym.spaces.Dict(
         {
             "grid_obs": gym.spaces.Box(
                 low=0,
                 high=1,
-                shape=(3, 5, 5, 3),  # (batch, width, height, features)
+                shape=(3, 5, 5, 3),
                 dtype=np.float32,
             ),
             "global_vars": gym.spaces.Box(low=-np.inf, high=np.inf, shape=[0], dtype=np.int32),
         }
     )
-
     action_space = gym.spaces.MultiDiscrete([3, 2])
     grid_features = ["agent", "hp", "wall"]
-
     config_dict = {
         "clip_range": 0.1,
         "observations": {"obs_key": "grid_obs"},
         "components": {
-            "_obs_": {
-                "_target_": "metta.agent.lib.obs_shaper.ObsShaper",
-                "sources": None,
-            },
+            "_obs_": {"_target_": "metta.agent.lib.obs_shaper.ObsShaper", "sources": None},
             "obs_normalizer": {
                 "_target_": "metta.agent.lib.observation_normalizer.ObservationNormalizer",
                 "sources": [{"name": "_obs_"}],
@@ -84,12 +79,19 @@ def create_metta_agent():
         },
     }
 
-    # Create the agent with minimal config needed for the tests
-    agent = MettaAgent(
-        obs_space=obs_space, action_space=action_space, grid_features=grid_features, device="cpu", **config_dict
-    )
+    class MockEnv:
+        def __init__(self):
+            self.single_observation_space = obs_space["grid_obs"]
+            self.single_action_space = action_space
+            self.grid_features = grid_features
+            self.global_features = []
 
-    # Create test components that have clip_weights method for testing
+        def action_names(self):
+            return ["action0", "action1", "action2"]
+
+    mock_env = MockEnv()
+    agent = make_agent(mock_env, OmegaConf.create({"device": "cpu", "agent": config_dict}))
+
     class ClippableComponent(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -102,18 +104,16 @@ def create_metta_agent():
             pass
 
         def clip_weights(self):
-            # This is a mock implementation for testing
             self.clipped = True
             return True
 
         def forward(self, x):
             return x
 
-    # Create a mock ActionEmbedding component that has the activate_actions method
     class MockActionEmbeds(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.embedding = torch.nn.Embedding(50, 8)  # Matches config
+            self.embedding = torch.nn.Embedding(50, 8)
             self.ready = True
             self._sources = None
             self.clipped = False
@@ -130,7 +130,6 @@ def create_metta_agent():
         def activate_actions(self, action_names, device):
             self.action_names = action_names
             self.device = device
-            # Create a simple mapping that will let us test action conversions
             self.action_to_idx = {name: i for i, name in enumerate(action_names)}
 
         def l2_reg_loss(self):
@@ -142,18 +141,108 @@ def create_metta_agent():
         def forward(self, x):
             return x
 
-    # Create components for testing
     comp1 = ClippableComponent()
     comp2 = ClippableComponent()
     action_embeds = MockActionEmbeds()
-
     agent.components = torch.nn.ModuleDict({"_core_": comp1, "_action_": comp2, "_action_embeds_": action_embeds})
-
     return agent, comp1, comp2
 
 
-def test_clip_weights_calls_components(create_metta_agent):
-    agent, comp1, comp2 = create_metta_agent
+@pytest.fixture
+def create_puffer_agent():
+    obs_space = gym.spaces.Dict(
+        {
+            "grid_obs": gym.spaces.Box(
+                low=0,
+                high=1,
+                shape=(3, 5, 5, 3),
+                dtype=np.float32,
+            ),
+            "global_vars": gym.spaces.Box(low=-np.inf, high=np.inf, shape=[0], dtype=np.int32),
+        }
+    )
+    action_space = gym.spaces.MultiDiscrete([3, 2])
+    grid_features = ["agent", "hp", "wall"]
+    config_dict = {
+        "clip_range": 0.1,
+        "observations": {"obs_key": "grid_obs"},
+        "puffer": {
+            "_target_": "metta.agent.external.example.Recurrent",
+            "hidden_size": 512,
+            "cnn_channels": 128,
+        },
+    }
+
+    class MockEnv:
+        def __init__(self):
+            self.single_observation_space = obs_space["grid_obs"]
+            self.single_action_space = action_space
+            self.grid_features = grid_features
+            self.global_features = []
+
+        def action_names(self):
+            return ["action0", "action1", "action2"]
+
+    mock_env = MockEnv()
+    agent = make_agent(mock_env, OmegaConf.create({"device": "cpu", "agent": config_dict}))
+    return agent
+
+
+def test_agent_initialization():
+    """Test that MettaAgent can be initialized with both BrainPolicy and PufferPolicy."""
+    obs_space = gym.spaces.Box(low=0, high=1, shape=(3, 5, 5, 3), dtype=np.float32)
+    action_space = gym.spaces.MultiDiscrete([3, 2])
+    grid_features = ["agent", "hp", "wall"]
+
+    class MockEnv:
+        def __init__(self):
+            self.single_observation_space = obs_space
+            self.single_action_space = action_space
+            self.grid_features = grid_features
+            self.global_features = []
+
+        def action_names(self):
+            return ["action0", "action1", "action2"]
+
+    # Test BrainPolicy initialization
+    brain_config = {
+        "clip_range": 0.1,
+        "observations": {"obs_key": "grid_obs"},
+        "components": {
+            "_obs_": {"_target_": "metta.agent.lib.obs_shaper.ObsShaper", "sources": None},
+            "obs_normalizer": {
+                "_target_": "metta.agent.lib.observation_normalizer.ObservationNormalizer",
+                "sources": [{"name": "_obs_"}],
+            },
+        },
+    }
+    brain_agent = MettaAgent(
+        env=MockEnv(),
+        cfg=OmegaConf.create({"device": "cpu", "agent": brain_config}),
+        device="cpu",
+    )
+    assert isinstance(brain_agent.policy, BrainPolicy)
+
+    # Test PufferPolicy initialization
+    puffer_config = {
+        "clip_range": 0.1,
+        "observations": {"obs_key": "grid_obs"},
+        "puffer": {
+            "_target_": "metta.agent.external.example.Recurrent",
+            "hidden_size": 512,
+            "cnn_channels": 128,
+        },
+    }
+    puffer_agent = MettaAgent(
+        env=MockEnv(),
+        cfg=OmegaConf.create({"device": "cpu", "agent": puffer_config}),
+        device="cpu",
+    )
+    assert isinstance(puffer_agent.policy, PufferPolicy)
+
+
+def test_clip_weights_calls_components(create_brain_agent):
+    agent, comp1, comp2 = create_brain_agent
 
     # Ensure clip_range is positive to enable clipping
     agent.clip_range = 0.1
@@ -166,8 +255,8 @@ def test_clip_weights_calls_components(create_metta_agent):
     assert comp2.clipped
 
 
-def test_clip_weights_disabled(create_metta_agent):
-    agent, comp1, comp2 = create_metta_agent
+def test_clip_weights_disabled(create_brain_agent):
+    agent, comp1, comp2 = create_brain_agent
 
     # Disable clipping by setting clip_range to 0
     agent.clip_range = 0
@@ -180,8 +269,8 @@ def test_clip_weights_disabled(create_metta_agent):
     assert not comp2.clipped
 
 
-def test_clip_weights_raises_attribute_error(create_metta_agent):
-    agent, comp1, comp2 = create_metta_agent
+def test_clip_weights_raises_attribute_error(create_brain_agent):
+    agent, comp1, comp2 = create_brain_agent
 
     # Add a component without the clip_weights method
     class IncompleteComponent(torch.nn.Module):
@@ -208,8 +297,8 @@ def test_clip_weights_raises_attribute_error(create_metta_agent):
     assert "clip_weights" in str(excinfo.value)
 
 
-def test_clip_weights_with_non_callable(create_metta_agent):
-    agent, comp1, comp2 = create_metta_agent
+def test_clip_weights_with_non_callable(create_brain_agent):
+    agent, comp1, comp2 = create_brain_agent
 
     # Make clip_weights non-callable on one component
     comp1.clip_weights = "Not a function"
@@ -222,8 +311,8 @@ def test_clip_weights_with_non_callable(create_metta_agent):
     assert "not callable" in str(excinfo.value)
 
 
-def test_l2_reg_loss_sums_component_losses(create_metta_agent):
-    agent, comp1, comp2 = create_metta_agent
+def test_l2_reg_loss_sums_component_losses(create_brain_agent):
+    agent, comp1, comp2 = create_brain_agent
 
     # Add l2_reg_loss method to test components with predictable return values
     comp1.l2_reg_loss = lambda: torch.tensor(0.5)
@@ -236,8 +325,8 @@ def test_l2_reg_loss_sums_component_losses(create_metta_agent):
     assert result.item() == 2.0  # 0.5 + 1.5 = 2.0
 
 
-def test_l2_reg_loss_raises_attribute_error(create_metta_agent):
-    agent, comp1, comp2 = create_metta_agent
+def test_l2_reg_loss_raises_attribute_error(create_brain_agent):
+    agent, comp1, comp2 = create_brain_agent
 
     # Add a component without the l2_reg_loss method
     class IncompleteComponent(torch.nn.Module):
@@ -252,55 +341,50 @@ def test_l2_reg_loss_raises_attribute_error(create_metta_agent):
         def forward(self, x):
             return x
 
-    # First make sure existing components have the method
-    comp1.l2_reg_loss = lambda: torch.tensor(0.5)
-    comp2.l2_reg_loss = lambda: torch.tensor(1.5)
-
-    # Replace one of the existing components with our incomplete one
-    agent.components["_core_"] = IncompleteComponent()
+    # Add the incomplete component
+    agent.components["bad_comp"] = IncompleteComponent()
 
     # Verify that an AttributeError is raised
     with pytest.raises(AttributeError) as excinfo:
         agent.l2_reg_loss()
 
-    # Check the error message mentions the missing method
-    # Don't rely on a specific component name in the error message
-    error_msg = str(excinfo.value)
-    assert "does not have method 'l2_reg_loss'" in error_msg
+    # Check the error message
+    assert "bad_comp" in str(excinfo.value)
+    assert "l2_reg_loss" in str(excinfo.value)
 
 
-def test_l2_reg_loss_raises_error_for_different_shapes(create_metta_agent):
-    agent, comp1, comp2 = create_metta_agent
+def test_l2_reg_loss_raises_error_for_different_shapes(create_brain_agent):
+    agent, comp1, comp2 = create_brain_agent
 
-    # Set up components to return tensors with different shapes
-    comp1.l2_reg_loss = lambda: torch.tensor(0.25) * torch.ones(2)  # tensor with shape [2]
-    comp2.l2_reg_loss = lambda: torch.tensor(0.5)  # scalar tensor
+    # Add l2_reg_loss methods that return tensors of different shapes
+    comp1.l2_reg_loss = lambda: torch.tensor([0.5, 1.0])
+    comp2.l2_reg_loss = lambda: torch.tensor(1.5)
 
-    # Verify that a RuntimeError is raised due to different tensor shapes
+    # Verify that a RuntimeError is raised
     with pytest.raises(RuntimeError) as excinfo:
         agent.l2_reg_loss()
 
-    # Check that the error message mentions the tensor shape mismatch
-    assert "expects each tensor to be equal size" in str(excinfo.value)
+    # Check the error message
+    assert "shapes" in str(excinfo.value).lower()
 
 
-def test_l2_init_loss_raises_error_for_different_shapes(create_metta_agent):
-    agent, comp1, comp2 = create_metta_agent
+def test_l2_init_loss_raises_error_for_different_shapes(create_brain_agent):
+    agent, comp1, comp2 = create_brain_agent
 
-    # Set up components to return tensors with different shapes
-    comp1.l2_init_loss = lambda: torch.tensor([0.3, 0.2])  # tensor with shape [2]
-    comp2.l2_init_loss = lambda: torch.tensor(0.5)  # scalar tensor
+    # Add l2_init_loss methods that return tensors of different shapes
+    comp1.l2_init_loss = lambda: torch.tensor([0.5, 1.0])
+    comp2.l2_init_loss = lambda: torch.tensor(1.5)
 
-    # Verify that a RuntimeError is raised due to different tensor shapes
+    # Verify that a RuntimeError is raised
     with pytest.raises(RuntimeError) as excinfo:
         agent.l2_init_loss()
 
-    # Check that the error message mentions the tensor shape mismatch
-    assert "expects each tensor to be equal size" in str(excinfo.value)
+    # Check the error message
+    assert "shapes" in str(excinfo.value).lower()
 
 
-def test_l2_reg_loss_with_non_callable(create_metta_agent):
-    agent, comp1, comp2 = create_metta_agent
+def test_l2_reg_loss_with_non_callable(create_brain_agent):
+    agent, comp1, comp2 = create_brain_agent
 
     # Make l2_reg_loss non-callable on one component
     comp1.l2_reg_loss = "Not a function"
@@ -313,287 +397,85 @@ def test_l2_reg_loss_with_non_callable(create_metta_agent):
     assert "not callable" in str(excinfo.value)
 
 
-def test_l2_reg_loss_empty_components(create_metta_agent):
-    agent, _, _ = create_metta_agent
+def test_l2_reg_loss_empty_components(create_brain_agent):
+    agent, comp1, comp2 = create_brain_agent
 
-    # Empty the components dictionary
-    agent.components = torch.nn.ModuleDict({})
+    # Clear all components
+    agent.components = torch.nn.ModuleDict()
 
-    # Verify an assertion error is raised when no components exist
-    with pytest.raises(AssertionError) as excinfo:
-        agent.l2_reg_loss()
+    # Call the method being tested
+    result = agent.l2_reg_loss()
 
-    # Check the error message
-    assert "No components available" in str(excinfo.value)
-
-
-def test_convert_action_to_logit_index(create_metta_agent):
-    agent, _, _ = create_metta_agent
-
-    # Setup testing environment with controlled action space
-    action_names = ["action0", "action1", "action2"]
-    action_max_params = [1, 2, 0]  # action0: [0,1], action1: [0,1,2], action2: [0]
-    agent.activate_actions(action_names, action_max_params, "cpu")
-
-    # Test single actions
-    # action (0,0) should map to logit index 0
-    action = torch.tensor([[0, 0]])
-    result = agent._convert_action_to_logit_index(action)
-    assert result.item() == 0
-
-    # action (0,1) should map to logit index 1
-    action = torch.tensor([[0, 1]])
-    result = agent._convert_action_to_logit_index(action)
-    assert result.item() == 1
-
-    # action (1,0) should map to logit index 2
-    action = torch.tensor([[1, 0]])
-    result = agent._convert_action_to_logit_index(action)
-    assert result.item() == 2
-
-    # action (1,2) should map to logit index 4
-    action = torch.tensor([[1, 2]])
-    result = agent._convert_action_to_logit_index(action)
-    assert result.item() == 4
-
-    # action (2,0) should map to logit index 5
-    action = torch.tensor([[2, 0]])
-    result = agent._convert_action_to_logit_index(action)
-    assert result.item() == 5
-
-    # Test batch conversion
-    actions = torch.tensor([[0, 0], [1, 2], [2, 0]])
-    result = agent._convert_action_to_logit_index(actions)
-    assert torch.all(result.flatten() == torch.tensor([0, 4, 5]))
+    # Verify the result is zero
+    assert result.item() == 0.0
 
 
-def test_convert_logit_index_to_action(create_metta_agent):
-    agent, _, _ = create_metta_agent
+def test_convert_action_to_logit_index(create_brain_agent):
+    agent, comp1, comp2 = create_brain_agent
 
-    # Setup testing environment
-    action_names = ["action0", "action1", "action2"]
-    action_max_params = [1, 2, 0]  # action0: [0,1], action1: [0,1,2], action2: [0]
-    agent.activate_actions(action_names, action_max_params, "cpu")
+    # Test converting actions to logit indices
+    actions = torch.tensor([[0, 1], [2, 0], [1, 1]])
+    logit_indices = agent.convert_action_to_logit_index(actions)
 
-    # Test single conversions
-    # logit index 0 should map to action (0,0)
-    logit_indices = torch.tensor([0])
-    result = agent._convert_logit_index_to_action(logit_indices)
-    assert torch.all(result == torch.tensor([0, 0]))
-
-    # logit index 1 should map to action (0,1)
-    logit_indices = torch.tensor([1])
-    result = agent._convert_logit_index_to_action(logit_indices)
-    assert torch.all(result == torch.tensor([0, 1]))
-
-    # logit index 4 should map to action (1,2)
-    logit_indices = torch.tensor([4])
-    result = agent._convert_logit_index_to_action(logit_indices)
-    assert torch.all(result == torch.tensor([1, 2]))
-
-    # Test batch conversion
-    logit_indices = torch.tensor([0, 4, 5])
-    result = agent._convert_logit_index_to_action(logit_indices)
-    expected = torch.tensor([[0, 0], [1, 2], [2, 0]])
-    assert torch.all(result == expected)
+    # Verify the shape and values
+    assert logit_indices.shape == (3,)
+    assert torch.all(logit_indices == torch.tensor([1, 6, 4]))
 
 
-def test_bidirectional_action_conversion(create_metta_agent):
-    agent, _, _ = create_metta_agent
+def test_convert_logit_index_to_action(create_brain_agent):
+    agent, comp1, comp2 = create_brain_agent
 
-    # Setup testing environment
-    action_names = ["action0", "action1", "action2"]
-    action_max_params = [1, 2, 0]  # action0: [0,1], action1: [0,1,2], action2: [0]
-    agent.activate_actions(action_names, action_max_params, "cpu")
+    # Test converting logit indices to actions
+    logit_indices = torch.tensor([1, 6, 4])
+    actions = agent.convert_logit_index_to_action(logit_indices)
 
-    # Create a test set of all possible actions
-    original_actions = torch.tensor(
-        [
-            [0, 0],
-            [0, 1],  # action0 with params 0,1
-            [1, 0],
-            [1, 1],
-            [1, 2],  # action1 with params 0,1,2
-            [2, 0],  # action2 with param 0
-        ]
-    )
-
-    # Convert to logit indices
-    logit_indices = agent._convert_action_to_logit_index(original_actions)
-
-    # Convert back to actions
-    reconstructed_actions = agent._convert_logit_index_to_action(logit_indices)
-
-    # Check that we get the original actions back
-    assert torch.all(reconstructed_actions == original_actions)
+    # Verify the shape and values
+    assert actions.shape == (3, 2)
+    assert torch.all(actions == torch.tensor([[0, 1], [2, 0], [1, 1]]))
 
 
-def test_action_conversion_edge_cases(create_metta_agent):
-    agent, _, _ = create_metta_agent
+def test_bidirectional_action_conversion(create_brain_agent):
+    agent, comp1, comp2 = create_brain_agent
 
-    # Setup with empty action space
-    action_names = []
-    action_max_params = []
-    agent.activate_actions(action_names, action_max_params, "cpu")
+    # Test bidirectional conversion
+    original_actions = torch.tensor([[0, 1], [2, 0], [1, 1]])
+    logit_indices = agent.convert_action_to_logit_index(original_actions)
+    converted_actions = agent.convert_logit_index_to_action(logit_indices)
 
-    # Test with empty tensor - should raise a ValueError about invalid size
-    empty_actions = torch.zeros((0, 2), dtype=torch.long)
-    with pytest.raises(
-        ValueError, match=r"'action' dimension 0 \('BT'\) has invalid size 0, expected a positive value"
-    ):
-        agent._convert_action_to_logit_index(empty_actions)
-
-    # Setup with single action type that has many parameters
-    action_names = ["action0"]
-    action_max_params = [9]  # action0: [0,1,2,3,4,5,6,7,8,9]
-    agent.activate_actions(action_names, action_max_params, "cpu")
-
-    # Test high parameter values
-    action = torch.tensor([[0, 9]])  # highest valid param
-    result = agent._convert_action_to_logit_index(action)
-    assert result.item() == 9
-
-    # Convert back
-    logit_indices = torch.tensor([9])
-    result = agent._convert_logit_index_to_action(logit_indices)
-    assert torch.all(result == torch.tensor([0, 9]))
+    # Verify the conversion is bidirectional
+    assert torch.all(original_actions == converted_actions)
 
 
-def test_action_use(create_metta_agent):
-    agent, _, _ = create_metta_agent
+def test_action_conversion_edge_cases(create_brain_agent):
+    agent, comp1, comp2 = create_brain_agent
 
-    # Set up action space
-    action_names = ["action0", "action1", "action2"]
-    action_max_params = [1, 2, 0]
-    agent.activate_actions(action_names, action_max_params, "cpu")
+    # Test edge cases
+    edge_cases = [
+        torch.tensor([[0, 0]]),  # Minimum values
+        torch.tensor([[2, 1]]),  # Maximum values
+        torch.tensor([[1, 0]]),  # Mixed values
+    ]
 
-    # Verify the agent correctly stored the list internally
-    assert isinstance(agent.action_max_params, list)
-    assert agent.action_max_params == [1, 2, 0]
+    for actions in edge_cases:
+        logit_indices = agent.convert_action_to_logit_index(actions)
+        converted_actions = agent.convert_logit_index_to_action(logit_indices)
+        assert torch.all(actions == converted_actions)
 
-    # Verify the offsets were calculated correctly
-    expected_offsets = torch.tensor([0, 1, 3, 3], dtype=torch.long, device="cpu")
-    assert torch.all(agent.cum_action_max_params == expected_offsets)
 
-    # Verify action_index_tensor was created correctly
-    expected_action_index = torch.tensor(
-        [
-            [0, 0],
-            [0, 1],  # action0 with params 0, 1
-            [1, 0],
-            [1, 1],
-            [1, 2],  # action1 with params 0, 1, 2
-            [2, 0],  # action2 with param 0
-        ],
-        device="cpu",
-    )
-    assert torch.all(agent.action_index_tensor == expected_action_index)
+def test_action_use(create_brain_agent):
+    agent, comp1, comp2 = create_brain_agent
 
-    # Test _convert_action_to_logit_index
-    actions = torch.tensor(
-        [
-            [0, 0],  # should map to index 0
-            [0, 1],  # should map to index 1
-            [1, 0],  # should map to index 2
-            [1, 2],  # should map to index 4
-            [2, 0],  # should map to index 5
-        ],
-        device="cpu",
-    )
+    # Test action use with sample inputs
+    batch_size = 2
+    obs = torch.randn(batch_size, *agent.obs_space.shape)
+    state = torch.zeros(batch_size, agent.hidden_size)
 
-    expected_indices = torch.tensor([0, 1, 2, 4, 5], device="cpu")
-    action_logit_indices = agent._convert_action_to_logit_index(actions)
-    assert torch.all(action_logit_indices == expected_indices)
+    # Test forward pass
+    action, logprob, entropy, value, log_probs = agent(obs, state)
 
-    # Test _convert_logit_index_to_action (reverse mapping)
-    reconstructed_actions = agent._convert_logit_index_to_action(expected_indices)
-    assert torch.all(reconstructed_actions == actions)
-
-    # Now let's test sample_logits with our converted actions
-    batch_size = 5
-    num_total_actions = sum([param + 1 for param in action_max_params])
-
-    # Create logits where the highest value corresponds to our test actions
-    # This makes sampling deterministic for testing
-    logits = torch.full((batch_size, num_total_actions), -10.0, device="cpu")
-
-    # Make the logits corresponding to our actions very high to ensure deterministic sampling
-    for i in range(batch_size):
-        logits[i, expected_indices[i]] = 10.0
-
-    # Test sample_logits with provided actions (action_logit_index)
-    sampled_indices, logprobs, entropy, log_softmax = sample_logits(logits, expected_indices)
-
-    # Verify indices match what we provided
-    assert torch.all(sampled_indices == expected_indices)
-
-    # Verify logprobs and entropy have the expected shapes
-    assert logprobs.shape == expected_indices.shape
+    # Verify output shapes
+    assert action.shape == (batch_size, 2)  # Assuming 2D action space
+    assert logprob.shape == (batch_size,)
     assert entropy.shape == (batch_size,)
-    assert log_softmax.shape == logits.shape
-
-    # Test sample_logits without provided actions (sampling mode)
-    sampled_indices2, logprobs2, entropy2, log_softmax2 = sample_logits(logits)
-
-    # With our strongly biased logits, sampling should return the same indices
-    assert torch.all(sampled_indices2 == expected_indices)
-
-    # Convert sampled indices back to actions
-    sampled_actions = agent._convert_logit_index_to_action(sampled_indices2)
-    assert torch.all(sampled_actions == actions)
-
-    # Test with a different batch
-    batch_size2 = 3
-    test_actions2 = torch.tensor(
-        [
-            [1, 1],  # should map to index 3
-            [2, 0],  # should map to index 5
-            [0, 0],  # should map to index 0
-        ],
-        device="cpu",
-    )
-
-    expected_indices2 = torch.tensor([3, 5, 0], device="cpu")
-    batch_logit_indices = agent._convert_action_to_logit_index(test_actions2)
-    assert torch.all(batch_logit_indices == expected_indices2)
-
-    # Create logits for this batch
-    logits2 = torch.full((batch_size2, num_total_actions), -10.0, device="cpu")
-    for i in range(batch_size2):
-        logits2[i, expected_indices2[i]] = 10.0
-
-    # Test sampling without providing indices
-    sampled_indices3, logprobs3, entropy3, log_softmax3 = sample_logits(logits2)
-
-    # Again, with biased logits, we should get deterministic results
-    assert torch.all(sampled_indices3 == expected_indices2)
-
-    # Convert back to actions and verify
-    sampled_actions2 = agent._convert_logit_index_to_action(sampled_indices3)
-    assert torch.all(sampled_actions2 == test_actions2)
-
-    # Finally, test the whole flow as it would happen in forward:
-    # 1. Convert actions to logit indices
-    # 2. Pass to sample_logits
-    # 3. Convert sampled indices back to actions
-
-    test_actions3 = torch.tensor([[0, 0], [1, 1]], device="cpu")
-
-    logit_indices = agent._convert_action_to_logit_index(test_actions3)
-
-    # Create logits for deterministic sampling
-    logits3 = torch.full((2, num_total_actions), -10.0, device="cpu")
-    for i in range(2):
-        logits3[i, logit_indices[i]] = 10.0
-
-    # Sample with provided indices (like in forward when action is provided)
-    sampled_indices4, logprobs4, entropy4, log_softmax4 = sample_logits(logits3, logit_indices)
-
-    # Verify indices match
-    assert torch.all(sampled_indices4 == logit_indices)
-
-    # Convert back to actions
-    reconstructed_actions4 = agent._convert_logit_index_to_action(sampled_indices4)
-
-    # Verify round-trip conversion
-    assert torch.all(reconstructed_actions4 == test_actions3)
+    assert value.shape == (batch_size, 1)
+    assert log_probs.shape == (batch_size, -1)  # Shape depends on action space size

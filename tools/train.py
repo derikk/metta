@@ -42,7 +42,12 @@ def train(cfg, wandb_run, logger: Logger):
 
     train_job = TrainJob(cfg.train_job)
 
-    policy_store = PolicyStore(cfg, wandb_run)
+    # Create a temporary environment for policy store initialization
+    from mettagrid.mettagrid_env import MettaGridEnv
+
+    temp_env_cfg = OmegaConf.create({"game": {"num_agents": 1}})
+    temp_env = MettaGridEnv(env_cfg=temp_env_cfg, render_mode=None)
+    policy_store = PolicyStore(temp_env, cfg, device=cfg.device)
 
     trainer = hydra.utils.instantiate(
         cfg.trainer, cfg, wandb_run, policy_store=policy_store, sim_suite_config=train_job.evals

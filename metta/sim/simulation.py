@@ -16,13 +16,14 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict
 
 import numpy as np
 import torch
 
+from metta.agent.metta_agent import MettaAgent
 from metta.agent.policy_state import PolicyState
-from metta.agent.policy_store import PolicyRecord, PolicyStore
+from metta.agent.policy_store import PolicyStore
 from metta.sim.simulation_config import SingleEnvSimulationConfig
 from metta.sim.simulation_stats_db import SimulationStatsDB
 from metta.sim.vecenv import make_vecenv
@@ -48,7 +49,7 @@ class Simulation:
         self,
         name: str,
         config: SingleEnvSimulationConfig,
-        policy_pr: PolicyRecord,
+        agent: MettaAgent,
         policy_store: PolicyStore,
         device: str,
         vectorization: str,
@@ -91,17 +92,17 @@ class Simulation:
         self._agents_per_env = self._env_cfg.game.num_agents
 
         # ---------------- policies ------------------------------------- #
-        self._policy_pr = policy_pr
+        self._agent = agent
         self._policy_store = policy_store
-        self._npc_pr = policy_store.policy(config.npc_policy_uri) if config.npc_policy_uri else None
-        self._policy_agents_pct = config.policy_agents_pct if self._npc_pr is not None else 1.0
+        self._npc_agent = policy_store.policy(config.npc_policy_uri) if config.npc_policy_uri else None
+        self._policy_agents_pct = config.policy_agents_pct if self._npc_agent is not None else 1.0
 
         # Let every policy know the active action-set of this env.
         action_names = self._vecenv.driver_env.action_names()
         max_args = self._vecenv.driver_env._c_env.max_action_args()
-        self._policy_pr.policy().activate_actions(action_names, max_args, self._device)
-        if self._npc_pr is not None:
-            self._npc_pr.policy().activate_actions(action_names, max_args, self._device)
+        self._agent.activate_actions(action_names, max_args, self._device)
+        if self._npc_agent is not None:
+            self._npc_agent.activate_actions(action_names, max_args, self._device)
 
         # ---------------- agent-index bookkeeping ---------------------- #
         idx_matrix = torch.arange(self._vecenv.num_agents, device=self._device).reshape(
@@ -151,14 +152,12 @@ class Simulation:
 
             # Candidate-policy agents
             my_obs = obs_t[self._policy_idxs]
-            policy = self._policy_pr.policy()
-            policy_actions, _, _, _, _ = policy(my_obs, self._policy_state)
+            policy_actions, _, _, _, _ = self._agent(my_obs, self._policy_state)
 
             # NPC agents (if any)
-            if self._npc_pr is not None and len(self._npc_idxs):
+            if self._npc_agent is not None and len(self._npc_idxs):
                 npc_obs = obs_t[self._npc_idxs]
-                npc_policy = self._npc_pr.policy()
-                npc_actions, _, _, _, _ = npc_policy(npc_obs, self._npc_state)
+                npc_actions, _, _, _, _ = self._npc_agent(npc_obs, self._npc_state)
 
         # ---------------- action stitching ----------------------- #
         actions = policy_actions
@@ -220,13 +219,13 @@ class Simulation:
     # ------------------------- stats helpers -------------------------- #
     def _from_shards_and_context(self) -> SimulationStatsDB:
         """Merge all *.duckdb* shards for this simulation → one `StatsDB`."""
-        agent_map: Dict[int, Tuple[str, int]] = {idx.item(): self._policy_pr for idx in self._policy_idxs}
-        if self._npc_pr is not None:
-            agent_map.update({idx.item(): self._npc_pr for idx in self._npc_idxs})
+        agent_map: Dict[int, MettaAgent] = {idx.item(): self._agent for idx in self._policy_idxs}
+        if self._npc_agent is not None:
+            agent_map.update({idx.item(): self._npc_agent for idx in self._npc_idxs})
 
         suite_name = "" if self._suite is None else self._suite.name
         db = SimulationStatsDB.from_shards_and_context(
-            self._id, self._stats_dir, agent_map, self._name, suite_name, self._config.env, self._policy_pr
+            self._id, self._stats_dir, agent_map, self._name, suite_name, self._config.env, self._agent
         )
         return db
 
@@ -248,7 +247,7 @@ class Simulation:
     def get_env(self):
         """Make sure this sim has a single env, and return it."""
         if len(self._vecenv.envs) != 1:
-            raise ValueError("Attempting to get single env, but simulation has multiple envs")
+            raise ValueError("Attempting to get single env, but simulation has multiple environments")
         return self._vecenv.envs[0]
 
 

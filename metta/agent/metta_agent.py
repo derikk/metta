@@ -1,42 +1,27 @@
-import logging
-from typing import List, Optional, Union
+"""
+This file implements the MettaAgent class, which is a wrapper around either BrainPolicy or PufferPolicy.
+It provides a unified interface for both policy types and handles the conversion between them.
+"""
 
-import einops
-import gymnasium as gym
-import hydra
-import numpy as np
+import logging
+from typing import List, Optional, Tuple, Union
+
 import torch
-from omegaconf import DictConfig, ListConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
+from metta.agent.brain_policy import BrainPolicy
 from metta.agent.policy_state import PolicyState
-from metta.agent.util.debug import assert_shape
-from metta.agent.util.distribution_utils import sample_logits
-from metta.agent.util.safe_get import safe_get_from_obs_space
-from metta.util.omegaconf import convert_to_dict
+from metta.agent.puffer_policy import PufferPolicy
 from mettagrid.mettagrid_env import MettaGridEnv
 
 logger = logging.getLogger("metta_agent")
 
 
-def make_policy(env: MettaGridEnv, cfg: ListConfig | DictConfig):
-    obs_space = gym.spaces.Dict(
-        {
-            "grid_obs": env.single_observation_space,
-            "global_vars": gym.spaces.Box(low=-np.inf, high=np.inf, shape=[0], dtype=np.int32),
-        }
-    )
-
-    return hydra.utils.instantiate(
-        cfg.agent,
-        obs_space=obs_space,
-        action_space=env.single_action_space,
-        grid_features=env.grid_features,
-        global_features=env.global_features,
-        device=cfg.device,
-        _recursive_=False,
-    )
+def make_agent(env: MettaGridEnv, cfg: Union[DictConfig, ListConfig], device: str = "cpu") -> "MettaAgent":
+    """Create a new MettaAgent instance."""
+    return MettaAgent(env=env, cfg=cfg, device=device)
 
 
 class DistributedMettaAgent(DistributedDataParallel):
@@ -51,111 +36,324 @@ class DistributedMettaAgent(DistributedDataParallel):
 
 
 class MettaAgent(nn.Module):
-    def __init__(
-        self,
-        obs_space: Union[gym.spaces.Space, gym.spaces.Dict],
-        action_space: gym.spaces.Space,
-        grid_features: List[str],
-        device: str,
-        **cfg,
-    ):
+    """Base class for all policy types."""
+
+    def __init__(self, env: MettaGridEnv, cfg: Union[DictConfig, ListConfig], device: str = "cpu"):
         super().__init__()
-        cfg = OmegaConf.create(cfg)
+        self.cfg = cfg
+        self.device = device
+        self.env = env
+        self.obs_space = env.single_observation_space
+        self.action_space = env.single_action_space
 
-        logger.info(f"obs_space: {obs_space} ")
+        # Initialize the appropriate policy
+        if hasattr(cfg.agent, "puffer"):
+            self.policy = PufferPolicy(env, cfg.agent, device)
+        else:
+            self.policy = BrainPolicy(env, cfg.agent, device)
 
-        self.hidden_size = cfg.components._core_.output_size
-        self.core_num_layers = cfg.components._core_.nn_params.num_layers
-        self.clip_range = cfg.clip_range
+        # Store agent attributes for compatibility
+        self.clip_range = cfg.agent.get("clip_range", 0.2)
+        self.hidden_size = self.policy.hidden_size
+        self.core_num_layers = self.policy.core_num_layers if hasattr(self.policy, "core_num_layers") else 1
 
-        assert hasattr(cfg.observations, "obs_key") and cfg.observations.obs_key is not None, (
-            "Configuration is missing required field 'observations.obs_key'"
-        )
-        obs_key = cfg.observations.obs_key  # typically "grid_obs"
+        # Set up action space
+        self.action_max_params = torch.tensor(env.single_action_space.nvec, device=device)
+        self.action_index_tensor = torch.arange(int(self.action_max_params.prod()), device=device)
+        self.action_names = None
+        self.active_actions = None
 
-        obs_shape = safe_get_from_obs_space(obs_space, obs_key, "shape")  # obs_w, obs_h, num_objects
-        num_objects = obs_shape[2]
+        # Set up L2 regularization
+        self.l2_init_weight_copy = None
+        self.update_l2_init_weight_copy()
 
-        self.agent_attributes = {
-            "clip_range": self.clip_range,
-            "action_space": action_space,
-            "grid_features": grid_features,
-            "obs_key": cfg.observations.obs_key,
-            "obs_shape": obs_shape,
-            "num_objects": num_objects,
-            "hidden_size": self.hidden_size,
-            "core_num_layers": self.core_num_layers,
-        }
+        # Policy metadata
+        self._uri = None
+        self._local_path = None
+        self._name = None
+        self._epoch = 0
+        self._agent_step = 0
+        self._generation = 0
+        self._train_time = 0
+        self._score = None
+        self._eval_scores = {}
 
-        logging.info(f"agent_attributes: {self.agent_attributes}")
+    @property
+    def uri(self) -> Optional[str]:
+        return self._uri
 
-        # self.observation_space = obs_space # for use with FeatureSetEncoder
-        # self.global_features = global_features # for use with FeatureSetEncoder
+    @uri.setter
+    def uri(self, value: str):
+        self._uri = value
 
-        self.components = nn.ModuleDict()
-        component_cfgs = convert_to_dict(cfg.components)
+    @property
+    def local_path(self) -> Optional[str]:
+        return self._local_path
 
-        for component_key in component_cfgs:
-            # Convert key to string to ensure compatibility
-            component_name = str(component_key)
-            component_cfgs[component_key]["name"] = component_name
-            logger.info(f"calling hydra instantiate from MettaAgent __init__ for {component_name}")
-            component = hydra.utils.instantiate(component_cfgs[component_key], **self.agent_attributes)
-            self.components[component_name] = component
+    @local_path.setter
+    def local_path(self, value: str):
+        self._local_path = value
 
-        component = self.components["_value_"]
-        self._setup_components(component)
-        component = self.components["_action_"]
-        self._setup_components(component)
+    @property
+    def name(self) -> Optional[str]:
+        return self._name
 
-        for name, component in self.components.items():
-            if not getattr(component, "ready", False):
-                raise RuntimeError(
-                    f"Component {name} in MettaAgent was never setup. It might not be accessible by other components."
-                )
+    @name.setter
+    def name(self, value: str):
+        self._name = value
 
-        self.components = self.components.to(device)
+    @property
+    def epoch(self) -> int:
+        return self._epoch
 
-        self._total_params = sum(p.numel() for p in self.parameters())
-        logger.info(f"Total number of parameters in MettaAgent: {self._total_params:,}. Setup complete.")
+    @epoch.setter
+    def epoch(self, value: int):
+        self._epoch = value
 
-    def _setup_components(self, component):
-        """_sources is a list of dicts albeit many layers simply have one element.
-        It must always have a "name" and that name should be the same as the relevant key in self.components.
-        source_components is a dict of components that are sources for the current component. The keys
-        are the names of the source components."""
-        # recursively setup all source components
-        if component._sources is not None:
-            for source in component._sources:
-                self._setup_components(self.components[source["name"]])
+    @property
+    def agent_step(self) -> int:
+        return self._agent_step
 
-        # setup the current component and pass in the source components
-        source_components = None
-        if component._sources is not None:
-            source_components = {}
-            for source in component._sources:
-                source_components[source["name"]] = self.components[source["name"]]
-        component.setup(source_components)
+    @agent_step.setter
+    def agent_step(self, value: int):
+        self._agent_step = value
 
-    def activate_actions(self, action_names: list[str], action_max_params: list[int], device):
-        """Run this at the beginning of training."""
+    @property
+    def generation(self) -> int:
+        return self._generation
 
+    @generation.setter
+    def generation(self, value: int):
+        self._generation = value
+
+    @property
+    def train_time(self) -> float:
+        return self._train_time
+
+    @train_time.setter
+    def train_time(self, value: float):
+        self._train_time = value
+
+    @property
+    def score(self) -> Optional[float]:
+        return self._score
+
+    @score.setter
+    def score(self, value: float):
+        self._score = value
+
+    @property
+    def eval_scores(self) -> dict:
+        return self._eval_scores
+
+    @eval_scores.setter
+    def eval_scores(self, value: dict):
+        self._eval_scores = value
+
+    def key_and_version(self) -> tuple[str, int]:
+        """Extract the policy key and version from the URI."""
+        if not self.uri:
+            return "", 0
+
+        # Get the last part after splitting by slash
+        base_name = self.uri.split("/")[-1]
+
+        # Check if it has a version number in format ":vNUM"
+        if ":" in base_name and ":v" in base_name:
+            parts = base_name.split(":v")
+            key = parts[0]
+            try:
+                version = int(parts[1])
+            except ValueError:
+                version = 0
+        else:
+            # No version, use the whole thing as key and version = 0
+            key = base_name
+            version = 0
+
+        return key, version
+
+    def key(self) -> str:
+        return self.key_and_version()[0]
+
+    def version(self) -> int:
+        return self.key_and_version()[1]
+
+    def expected_observation_channels(self) -> int:
+        """Get the expected number of observation channels."""
+        if hasattr(self.policy, "components") and isinstance(self.policy.components, dict):
+            cnn1 = self.policy.components.get("cnn1")
+            if cnn1 is not None and hasattr(cnn1, "_net") and len(cnn1._net) > 0:
+                weight = cnn1._net[0].weight
+                if isinstance(weight, torch.Tensor):
+                    return weight.shape[1]
+        return 0
+
+    def __repr__(self):
+        """Generate a detailed representation of the MettaAgent with weight shapes."""
+        # Basic agent info
+        lines = [f"MettaAgent(name={self.name}, uri={self.uri})"]
+
+        # Add key metadata
+        metadata_items = []
+        if self.epoch is not None:
+            metadata_items.append(f"epoch={self.epoch}")
+        if self.agent_step is not None:
+            metadata_items.append(f"agent_step={self.agent_step}")
+        if self.generation is not None:
+            metadata_items.append(f"generation={self.generation}")
+        if self.score is not None:
+            metadata_items.append(f"score={self.score}")
+
+        if metadata_items:
+            lines.append(f"Metadata: {', '.join(metadata_items)}")
+
+        # Add total parameter count
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        lines.append(f"Total parameters: {total_params:,} (trainable: {trainable_params:,})")
+
+        # Add module structure with detailed weight shapes
+        lines.append("\nModule Structure with Weight Shapes:")
+
+        for name, module in self.named_modules():
+            # Skip top-level module
+            if name == "":
+                continue
+
+            # Create indentation based on module hierarchy
+            indent = "  " * name.count(".")
+
+            # Get module type
+            module_type = module.__class__.__name__
+
+            # Start building the module info line
+            module_info = f"{indent}{name}: {module_type}"
+
+            # Get parameters for this module (non-recursive)
+            params = list(module.named_parameters(recurse=False))
+
+            # Add detailed parameter information
+            if params:
+                # For common layer types, add specialized shape information
+                if isinstance(module, torch.nn.Conv2d):
+                    weight = next((p for name, p in params if name == "weight"), None)
+                    if weight is not None:
+                        out_channels, in_channels, kernel_h, kernel_w = weight.shape
+                        module_info += " ["
+                        module_info += f"out_channels={out_channels}, "
+                        module_info += f"in_channels={in_channels}, "
+                        module_info += f"kernel=({kernel_h}, {kernel_w})"
+                        module_info += "]"
+
+                elif isinstance(module, torch.nn.Linear):
+                    weight = next((p for name, p in params if name == "weight"), None)
+                    if weight is not None:
+                        out_features, in_features = weight.shape
+                        module_info += f" [in_features={in_features}, out_features={out_features}]"
+
+                elif isinstance(module, torch.nn.LSTM):
+                    module_info += " ["
+                    module_info += f"input_size={module.input_size}, "
+                    module_info += f"hidden_size={module.hidden_size}, "
+                    module_info += f"num_layers={module.num_layers}"
+                    module_info += "]"
+
+                elif isinstance(module, torch.nn.Embedding):
+                    weight = next((p for name, p in params if name == "weight"), None)
+                    if weight is not None:
+                        num_embeddings, embedding_dim = weight.shape
+                        module_info += f" [num_embeddings={num_embeddings}, embedding_dim={embedding_dim}]"
+
+                # Add all parameter shapes
+                param_shapes = []
+                for param_name, param in params:
+                    param_shapes.append(f"{param_name}={list(param.shape)}")
+
+                if param_shapes and not any(
+                    x in module_info for x in ["out_channels", "in_features", "hidden_size", "num_embeddings"]
+                ):
+                    module_info += f" ({', '.join(param_shapes)})"
+
+            # Add formatted module info to output
+            lines.append(module_info)
+
+        # Add section for buffer shapes (non-parameter tensors like running_mean in BatchNorm)
+        buffers = list(self.named_buffers())
+        if buffers:
+            lines.append("\nBuffer Shapes:")
+            for name, buffer in buffers:
+                lines.append(f"  {name}: {list(buffer.shape)}")
+
+        return "\n".join(lines)
+
+    def forward(
+        self, x: torch.Tensor, state: Optional[PolicyState] = None, action: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass through the policy."""
+        if state is None:
+            state = PolicyState()
+        return self.policy(x, state, action)
+
+    def clip_weights(self) -> None:
+        """Clip the weights of the policy."""
+        if not self.clip_range:
+            return
+
+        if hasattr(self.policy, "clip_weights"):
+            self.policy.clip_weights(self.clip_range)
+
+    def l2_reg_loss(self) -> torch.Tensor:
+        """Compute the L2 regularization loss."""
+        if hasattr(self.policy, "l2_reg_loss"):
+            return self.policy.l2_reg_loss()
+        return torch.tensor(0.0, device=self.device)
+
+    def l2_init_loss(self) -> torch.Tensor:
+        """Compute the L2 initialization loss."""
+        if self.l2_init_weight_copy is None:
+            return torch.tensor(0.0, device=self.device)
+
+        if hasattr(self.policy, "l2_init_loss"):
+            return self.policy.l2_init_loss(self.l2_init_weight_copy)
+        return torch.tensor(0.0, device=self.device)
+
+    def update_l2_init_weight_copy(self) -> None:
+        """Update the L2 initialization weight copy."""
+        if hasattr(self.policy, "state_dict"):
+            self.l2_init_weight_copy = {k: v.clone() for k, v in self.policy.state_dict().items()}
+
+    def convert_action_to_logit_index(self, actions: torch.Tensor) -> torch.Tensor:
+        """Convert actions to logit indices."""
+        if actions.dim() == 1:
+            actions = actions.unsqueeze(0)
+        return torch.sum(actions * self.action_index_tensor, dim=1)
+
+    def convert_logit_index_to_action(self, logit_indices: torch.Tensor) -> torch.Tensor:
+        """Convert logit indices to actions."""
+        if logit_indices.dim() == 0:
+            logit_indices = logit_indices.unsqueeze(0)
+        actions = []
+        for idx in logit_indices:
+            action = []
+            remaining = idx
+            for max_param in reversed(self.action_max_params):
+                action.insert(0, remaining % max_param)
+                remaining = remaining // max_param
+            actions.append(action)
+        return torch.tensor(actions, device=self.device)
+
+    def activate_actions(self, action_names: List[str], action_max_params: List[int], device: str):
+        """Initialize action space for the policy"""
         assert isinstance(action_max_params, list), "action_max_params must be a list"
 
         self.device = device
-        self.action_max_params = action_max_params
+        self.action_max_params = torch.tensor(action_max_params, device=device)
         self.action_names = action_names
-
         self.active_actions = list(zip(action_names, action_max_params, strict=False))
 
         # Precompute cumulative sums for faster conversion
         self.cum_action_max_params = torch.cumsum(torch.tensor([0] + action_max_params, device=self.device), dim=0)
-
-        full_action_names = []
-        for action_name, max_param in self.active_actions:
-            for i in range(max_param + 1):
-                full_action_names.append(f"{action_name}_{i}")
-        self.components["_action_embeds_"].activate_actions(full_action_names, self.device)
 
         # Create action_index tensor
         action_index = []
@@ -164,270 +362,30 @@ class MettaAgent(nn.Module):
                 action_index.append([action_type_idx, j])
 
         self.action_index_tensor = torch.tensor(action_index, device=self.device)
-        logger.info(f"Agent actions activated with: {self.active_actions}")
+
+        # Activate actions in policy if supported
+        if hasattr(self.policy, "activate_actions"):
+            if callable(self.policy.activate_actions):
+                self.policy.activate_actions(action_names, action_max_params, device)
+
+        logger.info(f"MettaAgent actions activated with: {self.active_actions}")
 
     @property
     def lstm(self):
-        return self.components["_core_"]._net
+        return self.policy.lstm
 
     @property
     def total_params(self):
-        return self._total_params
-
-    def forward(self, x: torch.Tensor, state: PolicyState, action: Optional[torch.Tensor] = None):
-        """
-        Forward pass of the MettaAgent.
-
-        1. Inference mode (action=None): sample new actions based on the policy
-        - x shape: (BT, *self.obs_shape)
-        - Output action shape: (BT, 1) -- we return the action index rather than the (type, arg) tuple
-
-        2. BPTT training mode (action is provided): evaluate the policy on past actions
-        - x shape: (B, T, *self.obs_shape)
-        - action shape: (B, T, 2)
-        - Output action shape: (B, T, 2) -- we return the (type, arg) tuple
-
-        Args:
-            x: Input observation tensor
-            state: Policy state containing LSTM hidden and cell states
-            action: Optional action tensor for BPTT
-
-        Returns:
-            Tuple of (action, action_log_prob, entropy, value, log_probs)
-            - action: Sampled output action (inference) or same as input action (BPTT)
-            - action_log_prob: Log probability of the output action, shape (BT,)
-            - entropy: Entropy of the action distribution, shape (BT,)
-            - value: Value estimate, shape (BT,)
-            - log_probs: Log-softmax of logits, shape (BT, A) where A is the size of the action space
-        """
-        # rename parameter for clarity
-        bptt_action = action
-        del action
-
-        # TODO - obs_shape is not available in the eval smoke test policies so we can't
-        # check exact dimensions
-
-        # Default values in case obs_shape is not available
-        obs_w, obs_h, features = "W", "H", "F"
-
-        # Check if agent_attributes exists, is not None, and contains obs_shape
-        if (
-            hasattr(self, "agent_attributes")
-            and self.agent_attributes is not None
-            and "obs_shape" in self.agent_attributes
-        ):
-            # Get obs_shape and ensure it has the expected format
-            obs_shape = self.agent_attributes["obs_shape"]
-            if isinstance(obs_shape, (list, tuple)) and len(obs_shape) == 3:
-                obs_w, obs_h, features = obs_shape
-            # If the format is unexpected, we keep the default values
-
-        if bptt_action is not None:
-            # BPTT
-            if __debug__:
-                assert_shape(bptt_action, ("B", "T", 2), "bptt_action")
-
-            B, T, A = bptt_action.shape
-
-            if __debug__:
-                assert A == 2, f"Action dimensionality should be 2, got {A}"
-                assert_shape(x, (B, T, obs_w, obs_h, features), "x")
-
-            # Flatten batch and time dimensions for both action and x
-            bptt_action = einops.rearrange(bptt_action, "b t c -> (b t) c")
-            x = einops.rearrange(x, "b t ... -> (b t) ...")
-
-            if __debug__:
-                assert_shape(bptt_action, (B * T, 2), "flattened action")
-                assert_shape(x, (B * T, obs_w, obs_h, features), "flattened x")
-        else:
-            # inference
-            if __debug__:
-                assert_shape(x, ("BT", obs_w, obs_h, features), "x")
-
-        # Initialize dictionary for TensorDict
-        td = {"x": x, "state": None}
-
-        # Safely handle LSTM state
-        if state.lstm_h is not None and state.lstm_c is not None:
-            # Ensure states are on the same device as input
-            lstm_h = state.lstm_h.to(x.device)
-            lstm_c = state.lstm_c.to(x.device)
-            # Concatenate LSTM states along dimension 0
-            td["state"] = torch.cat([lstm_h, lstm_c], dim=0)
-
-        # Forward pass through value network
-        self.components["_value_"](td)
-        value = td["_value_"]
-
-        # Value shape is (BT, 1) - keeping the final dimension explicit (instead of squeezing)
-        # This design supports potential future extensions like distributional value functions
-        # or multi-head value networks which would require more than a scalar per state
-        if __debug__:
-            assert_shape(value, ("BT", 1), "value")
-
-        # Forward pass through action network
-        self.components["_action_"](td)
-        logits = td["_action_"]
-
-        if __debug__:
-            # here A is the size of the flattened action space (i.e. all valid (type, arg) combinations)
-            assert_shape(logits, ("BT", "A"), "logits")
-
-        # Update LSTM states
-        split_size = self.core_num_layers
-        state.lstm_h = td["state"][:split_size]
-        state.lstm_c = td["state"][split_size:]
-
-        # Sample actions
-        if bptt_action is not None:
-            # BPTT
-            bptt_action_index = self._convert_action_to_logit_index(bptt_action)
-
-            if __debug__:
-                action_space_size = logits.shape[-1]  # 'A' dimension size
-                max_index = bptt_action_index.max().item()
-                min_index = bptt_action_index.min().item()
-                if max_index >= action_space_size or min_index < 0:
-                    raise ValueError(
-                        f"Invalid action_logit_index: contains values outside the valid range"
-                        f" [0, {action_space_size - 1}]. "
-                        f"Found values in range [{min_index}, {max_index}]"
-                    )
-
-            action_index, action_log_prob, entropy, log_probs = sample_logits(logits, bptt_action_index)
-        else:
-            # inference
-            action_index, action_log_prob, entropy, log_probs = sample_logits(logits, None)
-
-        if __debug__:
-            assert_shape(action_index, ("BT",), "action_index")
-            assert_shape(action_log_prob, ("BT",), "action_log_prob")
-            assert_shape(entropy, ("BT",), "entropy")
-            assert_shape(log_probs, ("BT", "A"), "log_probs")
-
-        output_action = self._convert_logit_index_to_action(action_index)
-        if __debug__:
-            assert_shape(output_action, ("BT", 2), "output_action")
-
-        return output_action, action_log_prob, entropy, value, log_probs
-
-    def _convert_action_to_logit_index(self, action: torch.Tensor) -> torch.Tensor:
-        """
-        Convert (action_type, action_param) pairs to discrete action indices
-        using precomputed offsets.
-
-        Args:
-            action: Tensor of shape [B*T, 2] containing (action_type, action_param) pairs
-
-        Returns:
-            action_logit_indices: Tensor of shape [B*T] containing flattened action indices
-        """
-        if __debug__:
-            assert_shape(action, ("BT", 2), "action")
-
-        action_type_numbers = action[:, 0].long()
-        action_params = action[:, 1].long()
-
-        # Use precomputed cumulative sum with vectorized indexing
-        cumulative_sum = self.cum_action_max_params[action_type_numbers]
-        action_logit_indices = action_type_numbers + cumulative_sum + action_params
-
-        if __debug__:
-            assert_shape(action_logit_indices, ("BT",), "action_logit_indices")
-
-        return action_logit_indices  # shape: [B*T]
-
-    def _convert_logit_index_to_action(self, action_logit_index: torch.Tensor) -> torch.Tensor:
-        """
-        Convert logit indices back to action pairs using tensor indexing.
-
-        Args:
-            action_logit_index: Tensor of shape [B*T] containing flattened action indices
-
-        Returns:
-            action: Tensor of shape [B*T, 2] containing (action_type, action_param) pairs
-        """
-        if __debug__:
-            assert_shape(action_logit_index, ("BT",), "action_logit_index")
-
-        action = self.action_index_tensor[action_logit_index]
-
-        if __debug__:
-            assert_shape(action, ("BT", 2), "actions")
-
-        return action
-
-    def _apply_to_components(self, method_name, *args, **kwargs) -> List[torch.Tensor]:
-        """
-        Apply a method to all components, collecting and returning the results.
-
-        Args:
-            method_name: Name of the method to call on each component
-            *args, **kwargs: Arguments to pass to the method
-
-        Returns:
-            list: Results from calling the method on each component
-
-        Raises:
-            AttributeError: If any component doesn't have the requested method
-            TypeError: If a component's method is not callable
-            AssertionError: If no components are available
-        """
-        assert len(self.components) != 0, "No components available to apply method"
-
-        results = []
-        for name, component in self.components.items():
-            if not hasattr(component, method_name):
-                raise AttributeError(f"Component '{name}' does not have method '{method_name}'")
-
-            method = getattr(component, method_name)
-            if not callable(method):
-                raise TypeError(f"Component '{name}' has {method_name} attribute but it's not callable")
-
-            results.append(method(*args, **kwargs))
-
-        return results
-
-    def l2_reg_loss(self) -> torch.Tensor:
-        """L2 regularization loss is on by default although setting l2_norm_coeff to 0 effectively turns it off. Adjust
-        it by setting l2_norm_scale in your component config to a multiple of the global loss value or 0 to turn it off.
-        """
-        component_loss_tensors = self._apply_to_components("l2_reg_loss")
-        return torch.sum(torch.stack(component_loss_tensors))
-
-    def l2_init_loss(self) -> torch.Tensor:
-        """L2 initialization loss is on by default although setting l2_init_coeff to 0 effectively turns it off. Adjust
-        it by setting l2_init_scale in your component config to a multiple of the global loss value or 0 to turn it off.
-        """
-        component_loss_tensors = self._apply_to_components("l2_init_loss")
-        return torch.sum(torch.stack(component_loss_tensors))
-
-    def update_l2_init_weight_copy(self):
-        """Update interval set by l2_init_weight_update_interval. 0 means no updating."""
-        self._apply_to_components("update_l2_init_weight_copy")
-
-    def clip_weights(self):
-        """Weight clipping is on by default although setting clip_range or clip_scale to 0, or a large positive value
-        effectively turns it off. Adjust it by setting clip_scale in your component config to a multiple of the global
-        loss value or 0 to turn it off."""
-        if self.clip_range > 0:
-            self._apply_to_components("clip_weights")
+        return self.policy.total_params
 
     def compute_weight_metrics(self, delta: float = 0.01) -> List[dict]:
-        """Compute weight metrics for all components that have weights enabled for analysis.
-        Returns a list of metric dictionaries, one per component. Set analyze_weights to True in the config to turn it
-        on for a given component."""
-        results = {}
-        for name, component in self.components.items():
-            method_name = "compute_weight_metrics"
-            if not hasattr(component, method_name):
-                continue  # Skip components that don't have this method instead of raising an error
+        """Compute weight metrics"""
+        if hasattr(self.policy, "compute_weight_metrics"):
+            return self.policy.compute_weight_metrics(delta)
+        return []
 
-            method = getattr(component, method_name)
-            assert callable(method), f"Component '{name}' has {method_name} attribute but it's not callable"
-
-            results[name] = method(delta)
-
-        metrics_list = [metrics for metrics in results.values() if metrics is not None]
-        return metrics_list
+    def forward_training(self, *args, **kwargs):
+        fn = getattr(self.policy, "forward_training", None)
+        if callable(fn):
+            return fn(*args, **kwargs)
+        raise NotImplementedError("forward_training not available for this policy type")

@@ -3,6 +3,7 @@ import os
 import time
 from collections import defaultdict
 from pathlib import Path
+from typing import Dict, List, TypeVar, Union
 
 import numpy as np
 import pufferlib
@@ -12,7 +13,7 @@ from heavyball import ForeachMuon
 from omegaconf import DictConfig, ListConfig
 from pufferlib.utils import profile, unroll_nested_dict
 
-from metta.agent.metta_agent import DistributedMettaAgent, MettaAgent
+from metta.agent.metta_agent import MettaAgent
 from metta.agent.policy_state import PolicyState
 from metta.agent.policy_store import PolicyStore
 from metta.agent.util.weights_analysis import WeightsMetricsHelper
@@ -38,11 +39,13 @@ rank = int(os.environ.get("RANK", 0))
 local_rank = int(os.environ.get("LOCAL_RANK", 0))
 logger = logging.getLogger(f"trainer-{rank}-{local_rank}")
 
+T = TypeVar("T", float, List[float])
+
 
 class PufferTrainer:
     def __init__(
         self,
-        cfg: DictConfig | ListConfig,
+        cfg: Union[DictConfig, ListConfig],
         wandb_run,
         policy_store: PolicyStore,
         sim_suite_config: SimulationSuiteConfig,
@@ -68,7 +71,7 @@ class PufferTrainer:
         self.profile = Profile()
         self.torch_profiler = TorchProfiler(self._master, cfg.run_dir, cfg.trainer.profiler_interval_epochs, wandb_run)
         self.losses = self._make_losses()
-        self.stats = defaultdict(list)
+        self.stats: Dict[str, Union[float, List[float]]] = defaultdict(list)
         self.wandb_run = wandb_run
         self.policy_store = policy_store
         self.average_reward = 0.0  # Initialize average reward estimate
@@ -109,11 +112,11 @@ class PufferTrainer:
         assert policy_record is not None, "No policy found"
 
         if self._master:
-            logger.info(f"PufferTrainer loaded: {policy_record.policy()}")
+            logger.info(f"PufferTrainer loaded: {policy_record}")
 
         self._initial_pr = policy_record
         self.last_pr = policy_record
-        self.policy = policy_record.policy().to(self.device)
+        self.policy = policy_record.to(self.device)
         self.policy_record = policy_record
         self.uncompiled_policy = self.policy
 
@@ -134,7 +137,7 @@ class PufferTrainer:
             logger.info(f"Initializing DistributedDataParallel on device {self.device}")
             # Store the original policy for cleanup purposes
             self._original_policy = self.policy
-            self.policy = DistributedMettaAgent(self.policy, self.device)
+            self.policy = torch.nn.parallel.DistributedDataParallel(self.policy)
 
         self._make_experience_buffer()
 
@@ -154,26 +157,33 @@ class PufferTrainer:
         )
 
         # validate that policy matches environment
-        self.metta_agent: MettaAgent | DistributedMettaAgent = self.policy  # type: ignore
-        assert isinstance(self.metta_agent, (MettaAgent, DistributedMettaAgent, PufferAgent)), self.metta_agent
+        self.metta_agent: Union[MettaAgent, torch.nn.parallel.DistributedDataParallel] = self.policy  # type: ignore
+        assert isinstance(self.metta_agent, (MettaAgent, torch.nn.parallel.DistributedDataParallel, PufferAgent)), (
+            self.metta_agent
+        )
         _env_shape = metta_grid_env.single_observation_space.shape
         environment_shape = tuple(_env_shape) if isinstance(_env_shape, list) else _env_shape
 
-        if isinstance(self.metta_agent, (MettaAgent, DistributedMettaAgent)):
+        if isinstance(self.metta_agent, (MettaAgent, torch.nn.parallel.DistributedDataParallel)):
             found_match = False
-            for component_name, component in self.metta_agent.components.items():
-                if hasattr(component, "_obs_shape"):
-                    found_match = True
-                    component_shape = (
-                        tuple(component._obs_shape) if isinstance(component._obs_shape, list) else component._obs_shape
-                    )
-                    if component_shape != environment_shape:
-                        raise ValueError(
-                            f"Observation space mismatch error:\n"
-                            f"component_name: {component_name}\n"
-                            f"component_shape: {component_shape}\n"
-                            f"environment_shape: {environment_shape}\n"
-                        )
+            if hasattr(self.metta_agent, "policy") and hasattr(self.metta_agent.policy, "components"):
+                components = getattr(self.metta_agent.policy, "components", {})
+                if isinstance(components, dict):
+                    for component_name, component in components.items():
+                        if hasattr(component, "_obs_shape"):
+                            found_match = True
+                            component_shape = (
+                                tuple(component._obs_shape)
+                                if isinstance(component._obs_shape, list)
+                                else component._obs_shape
+                            )
+                            if component_shape != environment_shape:
+                                raise ValueError(
+                                    f"Observation space mismatch error:\n"
+                                    f"component_name: {component_name}\n"
+                                    f"component_shape: {component_shape}\n"
+                                    f"environment_shape: {environment_shape}\n"
+                                )
 
             if not found_match:
                 raise ValueError(
@@ -187,7 +197,7 @@ class PufferTrainer:
                 self.optimizer, T_max=self.trainer_cfg.total_timesteps // self.trainer_cfg.batch_size
             )
 
-        if checkpoint.agent_step > 0:
+        if checkpoint.agent_step > 0 and checkpoint.optimizer_state_dict is not None:
             self.optimizer.load_state_dict(checkpoint.optimizer_state_dict)
 
         if wandb_run and self._master:
@@ -276,14 +286,23 @@ class PufferTrainer:
         if not self._master:
             return
 
-        logger.info(f"Simulating policy: {self.last_pr.uri} with config: {self.sim_suite_config}")
+        if self._master:
+            if self.last_pr is not None:
+                logger.info(f"Simulating policy: {self.last_pr.uri} with config: {self.sim_suite_config}")
+            else:
+                logger.info("Simulating policy: <no uri> with config: {self.sim_suite_config}")
+        else:
+            logger.info(f"Simulating policy: <no uri> with config: {self.sim_suite_config}")
+        if self.last_pr is None:
+            logger.warning("No policy record available for simulation")
+            return
         sim = SimulationSuite(
             config=self.sim_suite_config,
-            policy_pr=self.last_pr,
+            agent=self.last_pr,
             policy_store=self.policy_store,
             device=self.device,
             vectorization=self.cfg.vectorization,
-            stats_dir=Path(self.cfg.run_dir) / "stats",
+            stats_dir=str(Path(self.cfg.run_dir) / "stats"),
         )
         result = sim.simulate()
         stats_db = EvalStatsDB.from_sim_stats_db(result.stats_db)
@@ -297,29 +316,32 @@ class PufferTrainer:
 
         # Compute scores for each evaluation category
         for category in self._eval_categories:
-            score = stats_db.get_average_metric_by_filter("reward", self.last_pr, f"sim_name LIKE '%{category}%'")
-            logger.info(f"{category} score: {score}")
-            # Only add the score if we got a non-None result
-            if score is not None:
-                self._eval_suite_avgs[f"{category}_score"] = score
-            else:
-                self._eval_suite_avgs[f"{category}_score"] = 0.0
+            if self.last_pr is not None:
+                score = stats_db.get_average_metric_by_filter("reward", self.last_pr, f"sim_name LIKE '%{category}%'")
+                logger.info(f"{category} score: {score}")
+                # Only add the score if we got a non-None result
+                if score is not None:
+                    self._eval_suite_avgs[f"{category}_score"] = score
+                else:
+                    self._eval_suite_avgs[f"{category}_score"] = 0.0
 
         # Get overall score (average of all rewards)
-        overall_score = stats_db.get_average_metric_by_filter("reward", self.last_pr)
-        self._current_eval_score = overall_score if overall_score is not None else 0.0
-        all_scores = stats_db.simulation_scores(self.last_pr, "reward")
+        if self.last_pr is not None:
+            overall_score = stats_db.get_average_metric_by_filter("reward", self.last_pr)
+            self._current_eval_score = overall_score if overall_score is not None else 0.0
+            all_scores = stats_db.simulation_scores(self.last_pr, "reward")
 
-        # Categorize scores by environment type
-        self._eval_grouped_scores = {}
-        # Process each score and assign to the right category
-        for (_, sim_name, _), score in all_scores.items():
-            for category in self._eval_categories:
-                if category in sim_name.lower():
-                    self._eval_grouped_scores[f"{category}/{sim_name.split('/')[-1]}"] = score
+            # Categorize scores by environment type
+            self._eval_grouped_scores = {}
+            # Process each score and assign to the right category
+            for (_, sim_name, _), score in all_scores.items():
+                for category in self._eval_categories:
+                    if category in sim_name.lower():
+                        self._eval_grouped_scores[f"{category}/{sim_name.split('/')[-1]}"] = score
 
     def _update_l2_init_weight_copy(self):
-        self.policy.update_l2_init_weight_copy()
+        if hasattr(self.policy, "update_l2_init_weight_copy") and callable(self.policy.update_l2_init_weight_copy):
+            self.policy.update_l2_init_weight_copy()
 
     def _on_train_step(self):
         pass
@@ -383,29 +405,59 @@ class PufferTrainer:
 
                 for i in info:
                     for k, v in unroll_nested_dict(i):
-                        infos[k].append(v)
+                        if isinstance(infos[k], list):
+                            if isinstance(v, (float, int, list)):
+                                infos[k].append(v)
+                        else:
+                            if k not in infos:
+                                infos[k] = v
+                            else:
+                                try:
+                                    infos[k] += v
+                                except TypeError:
+                                    infos[k] = [infos[k], v]  # fallback: bundle as list
 
             with profile.env:
                 actions = actions.cpu().numpy()
                 self.vecenv.send(actions)
 
-        with profile.eval_misc:
+        with profile.train_misc:
             for k, v in infos.items():
                 if isinstance(v, np.ndarray):
                     v = v.tolist()
 
                 if isinstance(v, list):
                     if k not in self.stats:
-                        self.stats[k] = []
-                    self.stats[k].extend(v)
+                        # Only assign if v is a list of floats or list of lists of floats
+                        if all(isinstance(item, (float, int, list)) for item in v):
+                            self.stats[k] = [float(item) for item in v if isinstance(item, (float, int))]
+                    elif isinstance(self.stats[k], list) and all(isinstance(item, (float, int, list)) for item in v):
+                        # Convert both to lists of floats before concatenation
+                        stats_list = (
+                            [float(item) for item in self.stats[k] if isinstance(item, (float, int))]
+                            if isinstance(self.stats[k], list)
+                            else [float(self.stats[k])]
+                        )
+                        v_list = [float(item) for item in v if isinstance(item, (float, int))]
+                        self.stats[k] = stats_list + v_list
                 else:
                     if k not in self.stats:
-                        self.stats[k] = v
+                        if isinstance(v, (float, int)):
+                            self.stats[k] = [float(v)]
+                        else:
+                            self.stats[k] = v
                     else:
                         try:
-                            self.stats[k] += v
+                            if isinstance(self.stats[k], list) and isinstance(v, (float, int)):
+                                self.stats[k].append(float(v))
+                            elif isinstance(self.stats[k], list) and isinstance(v, list):
+                                self.stats[k].extend([float(item) for item in v if isinstance(item, (float, int))])
+                            elif isinstance(self.stats[k], (float, int)) and isinstance(v, (float, int)):
+                                self.stats[k] = [float(self.stats[k]), float(v)]
+                            else:
+                                self.stats[k] = [self.stats[k], v]
                         except TypeError:
-                            self.stats[k] = [self.stats[k], v]  # fallback: bundle as list
+                            self.stats[k] = [self.stats[k], v]
 
         # TODO: Better way to enable multiple collects
         experience.ptr = 0
@@ -419,35 +471,42 @@ class PufferTrainer:
 
         with profile.train_misc:
             idxs = experience.sort_training_data()
-            dones_np = experience.dones_np[idxs]
-            values_np = experience.values_np[idxs]
-            rewards_np = experience.rewards_np[idxs]
+            dones_np = experience.dones_np[idxs] if experience.dones_np is not None else None
+            values_np = experience.values_np[idxs] if experience.values_np is not None else None
+            rewards_np = experience.rewards_np[idxs] if experience.rewards_np is not None else None
 
             # Update average reward estimate
             if self.trainer_cfg.average_reward:
-                # Update average reward estimate using EMA with configured alpha
-                alpha = self.trainer_cfg.average_reward_alpha
-                self.average_reward = (1 - alpha) * self.average_reward + alpha * np.mean(rewards_np)
-                # Adjust rewards by subtracting average reward for advantage computation
-                rewards_np_adjusted = rewards_np - self.average_reward
-                # Set gamma to 1.0 for average reward case
-                effective_gamma = 1.0
-                # Compute advantages using adjusted rewards
-                advantages_np = compute_gae(
-                    dones_np, values_np, rewards_np_adjusted, effective_gamma, self.trainer_cfg.gae_lambda
-                )
-                # For average reward case, returns are computed differently:
-                # R(s) = Σ(r_t - ρ) represents the bias function
-                experience.returns_np = advantages_np + values_np
+                if rewards_np is not None:
+                    alpha = self.trainer_cfg.average_reward_alpha
+                    self.average_reward = (1 - alpha) * self.average_reward + alpha * np.mean(rewards_np)
+                    # Adjust rewards by subtracting average reward for advantage computation
+                    rewards_np_adjusted = rewards_np - self.average_reward
+                    # Set gamma to 1.0 for average reward case
+                    effective_gamma = 1.0
+                    # Compute advantages using adjusted rewards
+                    advantages_np = (
+                        compute_gae(
+                            dones_np, values_np, rewards_np_adjusted, effective_gamma, self.trainer_cfg.gae_lambda
+                        )
+                        if dones_np is not None and values_np is not None
+                        else None
+                    )
+                    # For average reward case, returns are computed differently:
+                    # R(s) = Σ(r_t - ρ) represents the bias function
+                    if advantages_np is not None and values_np is not None:
+                        experience.returns_np = advantages_np + values_np
             else:
-                effective_gamma = self.trainer_cfg.gamma
-                # Standard GAE computation for discounted case
-                advantages_np = compute_gae(
-                    dones_np, values_np, rewards_np, effective_gamma, self.trainer_cfg.gae_lambda
-                )
-                experience.returns_np = advantages_np + values_np
+                if dones_np is not None and values_np is not None and rewards_np is not None:
+                    effective_gamma = self.trainer_cfg.gamma
+                    # Standard GAE computation for discounted case
+                    advantages_np = compute_gae(
+                        dones_np, values_np, rewards_np, effective_gamma, self.trainer_cfg.gae_lambda
+                    )
+                    experience.returns_np = advantages_np + values_np
 
-            experience.flatten_batch(advantages_np)
+            if "advantages_np" in locals() and advantages_np is not None:
+                experience.flatten_batch(advantages_np)
 
         # Optimizing the policy and value network
         total_minibatches = experience.num_minibatches * self.trainer_cfg.update_epochs
@@ -456,13 +515,13 @@ class PufferTrainer:
             teacher_lstm_state = []
             for mb in range(experience.num_minibatches):
                 with profile.train_misc:
-                    obs = experience.b_obs[mb]
-                    obs = obs.to(self.device, non_blocking=True)
-                    atn = experience.b_actions[mb]
-                    log_probs = experience.b_logprobs[mb]
-                    val = experience.b_values[mb]
-                    adv = experience.b_advantages[mb]
-                    ret = experience.b_returns[mb]
+                    obs = experience.b_obs[mb] if experience.b_obs is not None else None
+                    obs = obs.to(self.device, non_blocking=True) if obs is not None else None
+                    atn = experience.b_actions[mb] if experience.b_actions is not None else None
+                    log_probs = experience.b_logprobs[mb] if experience.b_logprobs is not None else None
+                    val = experience.b_values[mb] if experience.b_values is not None else None
+                    adv = experience.b_advantages[mb] if experience.b_advantages is not None else None
+                    ret = experience.b_returns[mb] if experience.b_returns is not None else None
 
                 with profile.train_forward:
                     _, newlogprob, entropy, newvalue, new_normalized_logits = self.policy(obs, lstm_state, action=atn)
@@ -470,51 +529,86 @@ class PufferTrainer:
                         torch.cuda.synchronize()
 
                 with profile.train_misc:
-                    logratio = newlogprob - log_probs.reshape(-1)
-                    ratio = logratio.exp()
+                    if newlogprob is not None and log_probs is not None:
+                        logratio = newlogprob - log_probs.reshape(-1)
+                        ratio = logratio.exp()
+                    else:
+                        logratio = None
+                        ratio = None
 
                     with torch.no_grad():
-                        # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                        old_approx_kl = (-logratio).mean()
-                        approx_kl = ((ratio - 1) - logratio).mean()
-                        clipfrac = ((ratio - 1.0).abs() > self.trainer_cfg.clip_coef).float().mean()
+                        if logratio is not None and ratio is not None:
+                            # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                            old_approx_kl = (-logratio).mean()
+                            approx_kl = ((ratio - 1) - logratio).mean()
+                            clipfrac = ((ratio - 1.0).abs() > self.trainer_cfg.clip_coef).float().mean()
+                        else:
+                            old_approx_kl = approx_kl = clipfrac = torch.tensor(0.0)
 
-                    adv = adv.reshape(-1)
-                    if self.trainer_cfg.norm_adv:
-                        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+                    if adv is not None:
+                        adv = adv.reshape(-1)
+                        if self.trainer_cfg.norm_adv:
+                            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-                    # Policy loss
-                    pg_loss1 = -adv * ratio
-                    pg_loss2 = -adv * torch.clamp(ratio, 1 - self.trainer_cfg.clip_coef, 1 + self.trainer_cfg.clip_coef)
-                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                    # Value loss
-                    newvalue = newvalue.view(-1)
-                    if self.trainer_cfg.clip_vloss:
-                        v_loss_unclipped = (newvalue - ret) ** 2
-                        v_clipped = val + torch.clamp(
-                            newvalue - val,
-                            -self.trainer_cfg.vf_clip_coef,
-                            self.trainer_cfg.vf_clip_coef,
+                    if adv is not None and ratio is not None:
+                        # Policy loss
+                        pg_loss1 = -adv * ratio
+                        pg_loss2 = -adv * torch.clamp(
+                            ratio, 1 - self.trainer_cfg.clip_coef, 1 + self.trainer_cfg.clip_coef
                         )
-                        v_loss_clipped = (v_clipped - ret) ** 2
-                        v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                        v_loss = 0.5 * v_loss_max.mean()
+                        pg_loss = torch.max(pg_loss1, pg_loss2).mean()
                     else:
-                        v_loss = 0.5 * ((newvalue - ret) ** 2).mean()
+                        pg_loss = torch.tensor(0.0)
 
-                    entropy_loss = entropy.mean()
+                    if newvalue is not None and ret is not None:
+                        newvalue = newvalue.view(-1)
+                        if self.trainer_cfg.clip_vloss:
+                            v_loss_unclipped = (newvalue - ret) ** 2
+                            v_clipped = (
+                                val
+                                + torch.clamp(
+                                    newvalue - val,
+                                    -self.trainer_cfg.vf_clip_coef,
+                                    self.trainer_cfg.vf_clip_coef,
+                                )
+                                if val is not None
+                                else None
+                            )
+                            v_loss_clipped = (v_clipped - ret) ** 2 if v_clipped is not None else None
+                            v_loss_max = (
+                                torch.max(v_loss_unclipped, v_loss_clipped)
+                                if v_loss_clipped is not None
+                                else v_loss_unclipped
+                            )
+                            v_loss = 0.5 * v_loss_max.mean() if v_loss_max is not None else torch.tensor(0.0)
+                        else:
+                            v_loss = 0.5 * ((newvalue - ret) ** 2).mean()
+                    else:
+                        v_loss = torch.tensor(0.0)
 
-                    ks_action_loss, ks_value_loss = self.kickstarter.loss(
-                        self.agent_step, new_normalized_logits, newvalue, obs, teacher_lstm_state
-                    )
+                    entropy_loss = entropy.mean() if entropy is not None else torch.tensor(0.0)
+
+                    if new_normalized_logits is not None and newvalue is not None and obs is not None:
+                        ks_action_loss, ks_value_loss = self.kickstarter.loss(
+                            self.agent_step, new_normalized_logits, newvalue, obs, teacher_lstm_state
+                        )
+                    else:
+                        ks_action_loss = ks_value_loss = torch.tensor(0.0)
 
                     l2_reg_loss = torch.tensor(0.0, device=self.device)
-                    if self.trainer_cfg.l2_reg_loss_coef > 0:
+                    if (
+                        self.trainer_cfg.l2_reg_loss_coef > 0
+                        and hasattr(self.policy, "l2_reg_loss")
+                        and callable(self.policy.l2_reg_loss)
+                    ):
                         l2_reg_loss = self.trainer_cfg.l2_reg_loss_coef * self.policy.l2_reg_loss().to(self.device)
 
                     l2_init_loss = torch.tensor(0.0, device=self.device)
-                    if self.trainer_cfg.l2_init_loss_coef > 0:
+                    if (
+                        self.trainer_cfg.l2_init_loss_coef > 0
+                        and hasattr(self.policy, "l2_init_loss")
+                        and callable(self.policy.l2_init_loss)
+                    ):
                         l2_init_loss = self.trainer_cfg.l2_init_loss_coef * self.policy.l2_init_loss().to(self.device)
 
                     loss = (
@@ -533,7 +627,11 @@ class PufferTrainer:
                     torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.trainer_cfg.max_grad_norm)
                     self.optimizer.step()
 
-                    if self.cfg.agent.clip_range > 0:
+                    if (
+                        self.cfg.agent.clip_range > 0
+                        and hasattr(self.policy, "clip_weights")
+                        and callable(self.policy.clip_weights)
+                    ):
                         self.policy.clip_weights()
 
                     if self.device == "cuda":
@@ -564,28 +662,33 @@ class PufferTrainer:
 
             y_pred = experience.values_np
             y_true = experience.returns_np
-            var_y = np.var(y_true)
-            explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-            self.losses.explained_variance = explained_var
+            if y_true is not None and y_pred is not None:
+                var_y = np.var(y_true)
+                explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+            else:
+                explained_var = np.nan
+            if self.losses is not None:
+                self.losses.explained_variance = explained_var
             self.epoch += 1
-            profile.update(self.agent_step, self.trainer_cfg.total_timesteps, self._timers)
+            profile.update(self.agent_step, self.trainer_cfg.total_timesteps, getattr(self, "_timers", None))
 
     def _checkpoint_trainer(self):
         if not self._master:
             return
 
         pr = self._checkpoint_policy()
-        self.checkpoint = TrainerCheckpoint(
-            self.agent_step,
-            self.epoch,
-            self.optimizer.state_dict(),
-            pr.local_path(),
-            average_reward=self.average_reward,  # Save average reward state
-        ).save(self.cfg.run_dir)
+        if pr is not None:
+            self.checkpoint = TrainerCheckpoint(
+                self.agent_step,
+                self.epoch,
+                self.optimizer.state_dict(),
+                pr.local_path(),
+                average_reward=self.average_reward,  # Save average reward state
+            ).save(self.cfg.run_dir)
 
     def _checkpoint_policy(self):
         if not self._master:
-            return
+            return None
 
         metta_grid_env: MettaGridEnv = self.vecenv.driver_env  # type: ignore
         assert isinstance(metta_grid_env, MettaGridEnv), "vecenv.driver_env must be a MettaGridEnv for checkpointing"
@@ -593,27 +696,29 @@ class PufferTrainer:
         name = self.policy_store.make_model_name(self.epoch)
 
         generation = 0
-        if self._initial_pr:
-            generation = self._initial_pr.metadata.get("generation", 0) + 1
+        if self._initial_pr and hasattr(self._initial_pr, "metadata"):
+            metadata = getattr(self._initial_pr, "metadata", {})
+            if isinstance(metadata, dict):
+                generation = metadata.get("generation", 0) + 1
+
+        policy_metadata = {
+            "agent_step": self.agent_step,
+            "epoch": self.epoch,
+            "run": self.cfg.run,
+            "action_names": metta_grid_env.action_names(),
+            "generation": generation,
+            "initial_uri": self._initial_pr.uri if self._initial_pr else None,
+            "train_time": time.time() - self.train_start,
+            "score": self._current_eval_score,
+            "eval_scores": self._eval_suite_avgs,
+        }
 
         self.last_pr = self.policy_store.save(
-            name,
             os.path.join(self.cfg.trainer.checkpoint_dir, name),
             self.uncompiled_policy,
-            metadata={
-                "agent_step": self.agent_step,
-                "epoch": self.epoch,
-                "run": self.cfg.run,
-                "action_names": metta_grid_env.action_names(),
-                "generation": generation,
-                "initial_uri": self._initial_pr.uri,
-                "train_time": time.time() - self.train_start,
-                "score": self._current_eval_score,
-                "eval_scores": self._eval_suite_avgs,
-            },
+            metadata=policy_metadata,
+            env=metta_grid_env,
         )
-        # this is hacky, but otherwise the initial_pr points
-        # at the same policy as the last_pr
         return self.last_pr
 
     def _save_policy_to_wandb(self):
@@ -624,15 +729,19 @@ class PufferTrainer:
             return
 
         pr = self._checkpoint_policy()
-        self.policy_store.add_to_wandb_run(self.wandb_run.name, pr)
+        if pr is not None:
+            self.policy_store.add_to_wandb_run(self.wandb_run.name, pr)
 
     def _generate_and_upload_replay(self):
         if self._master:
             logger.info("Generating and saving a replay to wandb and S3.")
+            if self.last_pr is None:
+                logger.warning("No policy record available for replay generation")
+                return
             replay_simulator = Simulation(
                 name=f"replay_{self.epoch}",
                 config=self.replay_sim_config,
-                policy_pr=self.last_pr,
+                agent=self.last_pr,
                 policy_store=self.policy_store,
                 device=self.device,
                 vectorization=self.cfg.vectorization,
@@ -641,9 +750,8 @@ class PufferTrainer:
             results = replay_simulator.simulate()
 
             if self.wandb_run is not None:
-                replay_urls = results.stats_db.get_replay_urls(
-                    policy_key=self.last_pr.key(), policy_version=self.last_pr.version()
-                )
+                # MettaAgent does not have key() or version(), so pass None
+                replay_urls = results.stats_db.get_replay_urls(policy_key=None, policy_version=None)
                 if len(replay_urls) > 0:
                     replay_url = replay_urls[0]
                     player_url = "https://metta-ai.github.io/metta/?replayUrl=" + replay_url
@@ -656,8 +764,9 @@ class PufferTrainer:
         for k in list(self.stats.keys()):
             v = self.stats[k]
             try:
-                v = np.mean(v)
-                self.stats[k] = v
+                if isinstance(v, list):
+                    v = np.mean(v)
+                    self.stats[k] = float(v)
             except (TypeError, ValueError):
                 del self.stats[k]
 
@@ -705,10 +814,10 @@ class PufferTrainer:
         self.vecenv.close()
 
     def initial_pr_uri(self):
-        return self._initial_pr.uri
+        return self._initial_pr.uri if self._initial_pr else None
 
     def last_pr_uri(self):
-        return self.last_pr.uri
+        return self.last_pr.uri if self.last_pr else None
 
     def _make_experience_buffer(self):
         """

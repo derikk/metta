@@ -15,7 +15,7 @@ from typing import Dict, List, Tuple, Union
 
 import duckdb
 
-from metta.agent.policy_store import PolicyRecord
+from metta.agent.metta_agent import MettaAgent
 from mettagrid.episode_stats_db import EpisodeStatsDB
 from mettagrid.util.file import exists, local_copy, write_file
 
@@ -80,11 +80,11 @@ class SimulationStatsDB(EpisodeStatsDB):
     def from_shards_and_context(
         sim_id: str,
         dir_with_shards: Union[str, Path],
-        agent_map: Dict[int, PolicyRecord],
+        agent_map: Dict[int, MettaAgent],
         sim_name: str,
         sim_suite: str,
         env: str,
-        policy_record: PolicyRecord,
+        agent: MettaAgent,
     ) -> "SimulationStatsDB":
         dir_with_shards = Path(dir_with_shards).expanduser().resolve()
         merged_path = dir_with_shards / "merged.duckdb"
@@ -103,7 +103,9 @@ class SimulationStatsDB(EpisodeStatsDB):
 
         merged = SimulationStatsDB(merged_path)
 
-        policy_key, policy_version = policy_record.key_and_version()
+        # For now, we'll use a placeholder for policy key and version since MettaAgent doesn't have these
+        policy_key = "metta_agent"
+        policy_version = 0
         merged._insert_simulation(sim_id, sim_name, sim_suite, env, policy_key, policy_version)
 
         # Merge each shard
@@ -116,8 +118,8 @@ class SimulationStatsDB(EpisodeStatsDB):
         logger.debug(f"Found {len(all_episode_ids)} episodes across all shards")
 
         if all_episode_ids:
-            # Convert agent_map with PolicyRecord to agent_map with (key, version) tuples
-            agent_tuple_map = {agent_id: record.key_and_version() for agent_id, record in agent_map.items()}
+            # For now, we'll use placeholder values for policy key and version
+            agent_tuple_map = {agent_id: (policy_key, policy_version) for agent_id in agent_map.keys()}
 
             merged._insert_agent_policies(all_episode_ids, agent_tuple_map)
             merged._update_episode_simulations(all_episode_ids, sim_id)
@@ -190,6 +192,7 @@ class SimulationStatsDB(EpisodeStatsDB):
             """,
             (sim_id, name, suite, env, policy_key, policy_version),
         )
+        return sim_id
 
     def _insert_agent_policies(
         self,
@@ -241,9 +244,16 @@ class SimulationStatsDB(EpisodeStatsDB):
             return
 
         # Merge
-        logger.debug(f"Before merge: {self.con.execute('SELECT COUNT(*) FROM episodes').fetchone()[0]} episodes")
+        before_count = self.con.execute("SELECT COUNT(*) FROM episodes").fetchone()
+        if before_count is not None:
+            logger.debug(f"Before merge: {before_count[0]} episodes")
+
         self._merge_db(other.path)
-        logger.debug(f"After merge: {self.con.execute('SELECT COUNT(*) FROM episodes').fetchone()[0]} episodes")
+
+        after_count = self.con.execute("SELECT COUNT(*) FROM episodes").fetchone()
+        if after_count is not None:
+            logger.debug(f"After merge: {after_count[0]} episodes")
+
         logger.debug(f"Merged {other_path} into {self.path}")
 
     # ------------------------------------------------------------------ #

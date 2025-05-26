@@ -2,7 +2,8 @@ import logging
 import uuid
 from pathlib import Path
 
-from metta.agent.policy_store import PolicyRecord, PolicyStore
+from metta.agent.metta_agent import MettaAgent
+from metta.agent.policy_store import PolicyStore
 from metta.sim.simulation import Simulation, SimulationResults
 from metta.sim.simulation_config import SimulationSuiteConfig
 from metta.sim.simulation_stats_db import SimulationStatsDB
@@ -20,7 +21,7 @@ class SimulationSuite:
     def __init__(
         self,
         config: SimulationSuiteConfig,
-        policy_pr: PolicyRecord,
+        agent: MettaAgent,
         policy_store: PolicyStore,
         device: str,
         vectorization: str,
@@ -28,7 +29,7 @@ class SimulationSuite:
         replay_dir: str | None = None,
     ):
         self._config = config
-        self._policy_pr = policy_pr
+        self._agent = agent
         self._policy_store = policy_store
         self._replay_dir = replay_dir
         self._stats_dir = stats_dir
@@ -48,7 +49,7 @@ class SimulationSuite:
             sim = Simulation(
                 name,
                 sim_config,
-                self._policy_pr,
+                self._agent,
                 self._policy_store,
                 device=self._device,
                 vectorization=self._vectorization,

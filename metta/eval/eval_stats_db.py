@@ -22,7 +22,7 @@ from typing import Dict, Optional
 
 import pandas as pd
 
-from metta.agent.policy_store import PolicyRecord
+from metta.agent.metta_agent import MettaAgent
 from metta.sim.simulation_stats_db import SimulationStatsDB
 from mettagrid.util.file import local_copy
 
@@ -193,7 +193,7 @@ class EvalStatsDB(SimulationStatsDB):
     def get_average_metric_by_filter(
         self,
         metric: str,
-        policy_record: PolicyRecord,
+        policy_record: MettaAgent,
         filter_condition: str | None = None,
     ) -> Optional[float]:
         pk, pv = policy_record.key_and_version()
@@ -202,7 +202,7 @@ class EvalStatsDB(SimulationStatsDB):
     def get_sum_metric_by_filter(
         self,
         metric: str,
-        policy_record: PolicyRecord,
+        policy_record: MettaAgent,
         filter_condition: str | None = None,
     ) -> Optional[float]:
         pk, pv = policy_record.key_and_version()
@@ -211,7 +211,7 @@ class EvalStatsDB(SimulationStatsDB):
     def get_std_metric_by_filter(
         self,
         metric: str,
-        policy_record: PolicyRecord,
+        policy_record: MettaAgent,
         filter_condition: str | None = None,
     ) -> Optional[float]:
         pk, pv = policy_record.key_and_version()
@@ -222,89 +222,171 @@ class EvalStatsDB(SimulationStatsDB):
     # ------------------------------------------------------------------ #
     def sample_count(
         self,
-        policy_record: Optional[PolicyRecord] = None,
+        policy_record: Optional[MettaAgent] = None,
         sim_suite: Optional[str] = None,
         sim_name: Optional[str] = None,
-        sim_env: Optional[str] = None,
     ) -> int:
-        """Return potential‑sample count for arbitrary filters."""
-        q = "SELECT COUNT(*) AS cnt FROM policy_simulation_agent_samples WHERE 1=1"
-        if policy_record:
-            pk, pv = policy_record.key_and_version()
-            q += f" AND policy_key = '{pk}' AND policy_version = {pv}"
-        if sim_suite:
-            q += f" AND sim_suite = '{sim_suite}'"
-        if sim_name:
-            q += f" AND sim_name  = '{sim_name}'"
-        if sim_env:
-            q += f" AND sim_env   = '{sim_env}'"
-        return int(self.query(q)["cnt"][0])
+        """Return the number of samples for *policy_record*."""
+        query = """
+        SELECT COUNT(*)
+        FROM episodes e
+        JOIN evaluations s ON e.evaluation_id = s.id
+        WHERE 1=1
+        """
+        params = []
+
+        if policy_record is not None:
+            # For now, we'll use placeholder values for policy key and version
+            pk = "metta_agent"
+            pv = 0
+            query += " AND s.policy_key = ? AND s.policy_version = ?"
+            params.extend([pk, pv])
+
+        if sim_suite is not None:
+            query += " AND s.suite = ?"
+            params.append(sim_suite)
+
+        if sim_name is not None:
+            query += " AND s.name = ?"
+            params.append(sim_name)
+
+        result = self.con.execute(query, params).fetchone()
+        return result[0] if result and result[0] is not None else 0
 
     # ------------------------------------------------------------------ #
     #   Per‑simulation breakdown                                         #
     # ------------------------------------------------------------------ #
-    def simulation_scores(self, policy_record: PolicyRecord, metric: str) -> Dict[tuple, float]:
+    def simulation_scores(self, policy_record: MettaAgent, metric: str) -> Dict[tuple, float]:
         """Return { (suite,name,env) : normalised mean(metric) }."""
-        pk, pv = policy_record.key_and_version()
-        sim_rows = self.query(f"""
-            SELECT DISTINCT sim_suite, sim_name, sim_env
-              FROM policy_simulation_agent_samples
-             WHERE policy_key     = '{pk}'
-               AND policy_version =  {pv}
-        """)
-        scores: Dict[tuple, float] = {}
-        for _, row in sim_rows.iterrows():
-            cond = f"sim_suite = '{row.sim_suite}' AND sim_name  = '{row.sim_name}'  AND sim_env   = '{row.sim_env}'"
-            val = self._normalised_value(pk, pv, metric, "AVG", cond)
-            if val is not None:
-                scores[(row.sim_suite, row.sim_name, row.sim_env)] = val
-        return scores
+        # For now, we'll use placeholder values for policy key and version
+        pk = "metta_agent"
+        pv = 0
+
+        query = f"""
+        WITH sim_means AS (
+            SELECT s.suite, s.name, s.env, AVG(e.{metric}) as mean_metric
+            FROM episodes e
+            JOIN evaluations s ON e.evaluation_id = s.id
+            WHERE s.policy_key = ? AND s.policy_version = ?
+            GROUP BY s.suite, s.name, s.env
+        )
+        SELECT suite, name, env, mean_metric
+        FROM sim_means
+        ORDER BY suite, name, env
+        """
+        result = self.con.execute(query, (pk, pv)).fetchall()
+        return {(row[0], row[1], row[2]): row[3] for row in result}
+
+    def simulation_breakdown(
+        self,
+        metric: str,
+        policy_record: MettaAgent | None = None,
+    ) -> pd.DataFrame:
+        """
+        Return a DataFrame with columns:
+        - suite: evaluation suite name
+        - name: evaluation name
+        - env: environment name
+        - metric: mean value of the metric
+        - std: standard deviation of the metric
+        - n: number of episodes
+        """
+        if policy_record is not None:
+            # For now, we'll use placeholder values for policy key and version
+            pk = "metta_agent"
+            pv = 0
+            policy_filter = "AND s.policy_key = ? AND s.policy_version = ?"
+            params = (pk, pv)
+        else:
+            policy_filter = ""
+            params = ()
+
+        query = f"""
+        SELECT s.suite, s.name, s.env,
+               AVG(e.{metric}) as metric,
+               STDDEV(e.{metric}) as std,
+               COUNT(*) as n
+        FROM episodes e
+        JOIN evaluations s ON e.evaluation_id = s.id
+        WHERE e.{metric} IS NOT NULL {policy_filter}
+        GROUP BY s.suite, s.name, s.env
+        ORDER BY s.suite, s.name, s.env
+        """
+        return pd.DataFrame(
+            self.con.execute(query, params).fetchall(), columns=["suite", "name", "env", "metric", "std", "n"]
+        )
 
     def metric_by_policy_eval(
         self,
         metric: str,
-        policy_record: PolicyRecord | None = None,
-    ) -> pd.DataFrame:
-        """
-        Return a DataFrame with columns
-            policy_uri | eval_name | value
+        policy_record: MettaAgent,
+        filter_condition: str | None = None,
+    ) -> Optional[float]:
+        """Return the mean value of *metric* for *policy_record*."""
+        # For now, we'll use placeholder values for policy key and version
+        pk = "metta_agent"
+        pv = 0
 
-        * `policy_uri` →  "key:v<version>"
-        * `eval_name`  →  `sim_env`
-        * `value`      →  normalised mean of *metric*
+        query = f"""
+        SELECT AVG(e.{metric})
+        FROM episodes e
+        JOIN evaluations s ON e.evaluation_id = s.id
+        WHERE s.policy_key = ? AND s.policy_version = ?
         """
-        if policy_record is not None:
-            policy_key, policy_version = policy_record.key_and_version()
-            policy_clause = f"policy_key = '{policy_key}' AND policy_version = {policy_version}"
-        else:
-            # All policies
-            policy_clause = "1=1"
+        params = [pk, pv]
 
-        sql = f"""
-        WITH potential AS (
-            SELECT policy_key, policy_version, sim_env, COUNT(*) AS potential_cnt
-              FROM policy_simulation_agent_samples
-             WHERE {policy_clause}
-             GROUP BY policy_key, policy_version, sim_env
-        ),
-        recorded AS (
-            SELECT policy_key,
-                   policy_version,
-                   sim_env,
-                   SUM(value) AS recorded_sum
-              FROM policy_simulation_agent_metrics
-             WHERE metric = '{metric}'
-               AND {policy_clause}
-             GROUP BY policy_key, policy_version, sim_env
-        )
-        SELECT
-            potential.policy_key || ':v' || potential.policy_version AS policy_uri,
-            potential.sim_env                              AS eval_name,
-            COALESCE(recorded.recorded_sum, 0) * 1.0
-                   / potential.potential_cnt               AS value
-        FROM potential
-        LEFT JOIN recorded
-          USING (policy_key, policy_version, sim_env)
-        ORDER BY policy_uri, eval_name
+        if filter_condition:
+            query += f" AND {filter_condition}"
+
+        result = self.con.execute(query, params).fetchone()
+        return result[0] if result and result[0] is not None else None
+
+    def metric_by_policy_eval_std(
+        self,
+        metric: str,
+        policy_record: MettaAgent,
+        filter_condition: str | None = None,
+    ) -> Optional[float]:
+        """Return the standard deviation of *metric* for *policy_record*."""
+        # For now, we'll use placeholder values for policy key and version
+        pk = "metta_agent"
+        pv = 0
+
+        query = f"""
+        SELECT STDDEV(e.{metric})
+        FROM episodes e
+        JOIN evaluations s ON e.evaluation_id = s.id
+        WHERE s.policy_key = ? AND s.policy_version = ?
         """
-        return self.query(sql)
+        params = [pk, pv]
+
+        if filter_condition:
+            query += f" AND {filter_condition}"
+
+        result = self.con.execute(query, params).fetchone()
+        return result[0] if result and result[0] is not None else None
+
+    def metric_by_policy_eval_count(
+        self,
+        metric: str,
+        policy_record: MettaAgent,
+        filter_condition: str | None = None,
+    ) -> Optional[int]:
+        """Return the count of *metric* for *policy_record*."""
+        # For now, we'll use placeholder values for policy key and version
+        pk = "metta_agent"
+        pv = 0
+
+        query = f"""
+        SELECT COUNT(e.{metric})
+        FROM episodes e
+        JOIN evaluations s ON e.evaluation_id = s.id
+        WHERE s.policy_key = ? AND s.policy_version = ?
+        """
+        params = [pk, pv]
+
+        if filter_condition:
+            query += f" AND {filter_condition}"
+
+        result = self.con.execute(query, params).fetchone()
+        return result[0] if result and result[0] is not None else None
