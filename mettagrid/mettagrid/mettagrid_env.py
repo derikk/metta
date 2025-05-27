@@ -66,6 +66,41 @@ class MettaGridEnv(pufferlib.PufferEnv, gym.Env):
         OmegaConf.resolve(env_cfg)
         return env_cfg
 
+    def _validate_buffers(self):
+        """Validate that all required buffers are initialized and have correct types/shapes."""
+        required_buffers = ["observations", "terminals", "truncations", "rewards", "actions"]
+        for buf_name in required_buffers:
+            if not hasattr(self, buf_name) or getattr(self, buf_name) is None:
+                raise RuntimeError(f"Buffer {buf_name} not initialized")
+
+        # Validate observation buffer shape
+        if self._c_env.use_observation_tokens():
+            expected_shape = (self._num_agents, self._c_env.num_observation_tokens(), 3)
+        else:
+            expected_shape = (
+                self._num_agents,
+                self._c_env.obs_height(),
+                self._c_env.obs_width(),
+                len(self._c_env.grid_features()),
+            )
+
+        if self.observations.shape != expected_shape:
+            raise ValueError(
+                f"Observation buffer shape mismatch: got {self.observations.shape}, expected {expected_shape}"
+            )
+
+        # Validate buffer types
+        if self.observations.dtype != np.uint8:
+            raise ValueError(f"Observations must be uint8, got {self.observations.dtype}")
+        if self.terminals.dtype != bool:
+            raise ValueError(f"Terminals must be bool, got {self.terminals.dtype}")
+        if self.truncations.dtype != bool:
+            raise ValueError(f"Truncations must be bool, got {self.truncations.dtype}")
+        if self.rewards.dtype != np.float32:
+            raise ValueError(f"Rewards must be float32, got {self.rewards.dtype}")
+        if self.actions.dtype != np.int32:
+            raise ValueError(f"Actions must be int32, got {self.actions.dtype}")
+
     def _reset_env(self):
         mettagrid_config = MettaGridConfig(self._env_cfg, self._env_map)
 
@@ -77,16 +112,19 @@ class MettaGridEnv(pufferlib.PufferEnv, gym.Env):
         self._num_agents = self._c_env.num_agents()
 
         env = self._grid_env
-
         self._env = env
-        # self._env = RewardTracker(self._env)
 
     @override
     def reset(self, seed: int | None = None, options: dict | None = None) -> tuple[np.ndarray, dict]:
         self._env_cfg = self._get_new_env_cfg()
         self._reset_env()
 
+        # Ensure buffers are initialized before setting them
+        if not hasattr(self, "observations") or self.observations is None:
+            raise RuntimeError("Buffers not initialized")
+
         self._c_env.set_buffers(self.observations, self.terminals, self.truncations, self.rewards)
+        self._validate_buffers()
 
         self._episode_id = self._make_episode_id()
         self._current_seed = seed or 0
@@ -99,8 +137,15 @@ class MettaGridEnv(pufferlib.PufferEnv, gym.Env):
         return obs, infos
 
     @override
-    def step(self, actions: list[list[int]]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
-        self.actions[:] = np.array(actions).astype(np.uint32)
+    def step(
+        self, actions: np.ndarray | list[list[int]]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
+        # Convert actions to the correct type and shape
+        actions = np.asarray(actions, dtype=np.int32)
+        if actions.shape != (self._num_agents,):
+            raise ValueError(f"Actions must have shape ({self._num_agents},), got {actions.shape}")
+
+        self.actions[:] = actions
 
         if self._replay_writer:
             self._replay_writer.log_pre_step(self._episode_id, self.actions)

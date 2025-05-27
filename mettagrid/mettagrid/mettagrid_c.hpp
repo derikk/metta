@@ -62,6 +62,12 @@ public:
                              const py::dict& group_cfg_py,
                              const py::dict& agent_cfg_py);
 
+  bool use_observation_tokens() const;
+  unsigned int num_observation_tokens() const;
+  unsigned short obs_height() const;
+  unsigned short obs_width() const;
+  const std::vector<std::string>& grid_features() const;
+
 private:
   // Member variables
   py::dict _cfg;

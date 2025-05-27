@@ -425,20 +425,82 @@ void MettaGrid::validate_buffers() {
   }
 }
 
-void MettaGrid::set_buffers(py::array_t<uint8_t, py::array::c_style>& observations,
-                            py::array_t<bool, py::array::c_style>& terminals,
-                            py::array_t<bool, py::array::c_style>& truncations,
-                            py::array_t<float, py::array::c_style>& rewards) {
-  _observations = observations;
-  _terminals = terminals;
-  _truncations = truncations;
-  _rewards = rewards;
-  _episode_rewards = py::array_t<float, py::array::c_style>({static_cast<ssize_t>(_rewards.shape(0))}, {sizeof(float)});
-  for (size_t i = 0; i < _agents.size(); i++) {
-    _agents[i]->init(&_rewards.mutable_unchecked<1>()(i));
-  }
+void MettaGrid::set_buffers(py::array_t<uint8_t> observations,
+                           py::array_t<bool> terminals,
+                           py::array_t<bool> truncations,
+                           py::array_t<float> rewards) {
+    // Validate buffer types
+    if (observations.dtype() != py::dtype::of<uint8_t>()) {
+        throw std::runtime_error("Observations must be uint8");
+    }
+    if (terminals.dtype() != py::dtype::of<bool>()) {
+        throw std::runtime_error("Terminals must be bool");
+    }
+    if (truncations.dtype() != py::dtype::of<bool>()) {
+        throw std::runtime_error("Truncations must be bool");
+    }
+    if (rewards.dtype() != py::dtype::of<float>()) {
+        throw std::runtime_error("Rewards must be float32");
+    }
 
-  validate_buffers();
+    // Validate buffer shapes
+    if (_use_observation_tokens) {
+        std::vector<ssize_t> expected_shape = {
+            static_cast<ssize_t>(_agents.size()),
+            static_cast<ssize_t>(_num_observation_tokens),
+            static_cast<ssize_t>(3)
+        };
+        if (observations.shape() != expected_shape) {
+            throw std::runtime_error("Invalid observation buffer shape");
+        }
+    } else {
+        std::vector<ssize_t> expected_shape = {
+            static_cast<ssize_t>(_agents.size()),
+            static_cast<ssize_t>(_obs_height),
+            static_cast<ssize_t>(_obs_width),
+            static_cast<ssize_t>(_grid_features.size())
+        };
+        if (observations.shape() != expected_shape) {
+            throw std::runtime_error("Invalid observation buffer shape");
+        }
+    }
+
+    std::vector<ssize_t> expected_1d_shape = {static_cast<ssize_t>(_agents.size())};
+    if (terminals.shape() != expected_1d_shape) {
+        throw std::runtime_error("Invalid terminals buffer shape");
+    }
+    if (truncations.shape() != expected_1d_shape) {
+        throw std::runtime_error("Invalid truncations buffer shape");
+    }
+    if (rewards.shape() != expected_1d_shape) {
+        throw std::runtime_error("Invalid rewards buffer shape");
+    }
+
+    // Set the buffers
+    _observations = observations;
+    _terminals = terminals;
+    _truncations = truncations;
+    _rewards = rewards;
+}
+
+bool MettaGrid::use_observation_tokens() const {
+    return _use_observation_tokens;
+}
+
+unsigned int MettaGrid::num_observation_tokens() const {
+    return _num_observation_tokens;
+}
+
+unsigned short MettaGrid::obs_height() const {
+    return _obs_height;
+}
+
+unsigned short MettaGrid::obs_width() const {
+    return _obs_width;
+}
+
+const std::vector<std::string>& MettaGrid::grid_features() const {
+    return _grid_features;
 }
 
 py::tuple MettaGrid::step(py::array_t<int> actions) {
