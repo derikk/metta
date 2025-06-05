@@ -2,112 +2,90 @@
 Unit tests for the StatsWriter functionality in mettagrid.stats_writer.
 """
 
-import datetime
-import tempfile
-import uuid
-from pathlib import Path
-
 import pytest
+from testcontainers.postgres import PostgresContainer
 
-from mettagrid.episode_stats_db import EpisodeStatsDB
+from mettagrid.postgres_stats_db import PostgresStatsDB
 from mettagrid.stats_writer import StatsWriter
 
 
 @pytest.fixture
-def temp_dir():
-    """Create a temporary directory for test files."""
-    with tempfile.TemporaryDirectory() as tmpdirname:
-        yield Path(tmpdirname)
+def postgres_container():
+    """Create a PostgreSQL container for testing."""
+    with PostgresContainer("postgres:17", driver=None) as postgres:
+        yield postgres
 
 
-def test_stats_writer_initialization(temp_dir):
-    """Test that StatsWriter initializes correctly."""
-    writer = StatsWriter(temp_dir)
-    assert writer.dir == temp_dir
-    assert writer.db is None  # Database should be created on demand
+@pytest.fixture
+def db_url(postgres_container):
+    """Get the database URL for the PostgreSQL container."""
+    return postgres_container.get_connection_url()
 
 
-def test_ensure_db(temp_dir):
-    """Test that _ensure_db creates a database when needed."""
-    writer = StatsWriter(temp_dir)
-    writer._ensure_db()
-    assert writer.db is not None
-    assert isinstance(writer.db, EpisodeStatsDB)
-
-    # Check that the database file exists
-    db_files = list(temp_dir.glob("*.duckdb"))
-    assert len(db_files) == 1
-
-    writer.close()
-
-
-def test_episode_lifecycle(temp_dir):
+def test_episode_lifecycle(db_url):
     """Test the full lifecycle of an episode."""
-    writer = StatsWriter(temp_dir)
+    writer = StatsWriter(db_url, eval_name="test_eval", simulation_suite="test_suite")
 
-    # Create episode ID
-    episode_id = str(uuid.uuid4())
+    with PostgresStatsDB(db_url) as db:
+        policy_id_1 = db.create_policy("test_policy_1", "test_description", "test_url", None)
+        policy_id_2 = db.create_policy("test_policy_2", "test_description", "test_url", None)
+
+    # Set agent policies (required for the new schema)
+    agent_policies = {0: policy_id_1, 1: policy_id_2}  # agent_id -> policy_id mapping
+    writer.set_agent_policies(agent_policies)
 
     # Episode attributes
     attributes = {"seed": "12345", "map_w": "10", "map_h": "20", "meta": '{"key": "value"}'}
 
     # Metrics
     agent_metrics = {0: {"reward": 10.5, "steps": 50.0}, 1: {"reward": 8.2, "steps": 45.0}}
-    agent_groups = {0: 0, 1: 1}
 
-    # Step count and timestamps
-    step_count = 100
-    created_at = datetime.datetime.now()
+    # Replay URL
     replay_url = "https://example.com/replay.json"
 
     # Record the complete episode
-    writer.record_episode(episode_id, attributes, agent_metrics, agent_groups, step_count, replay_url, created_at)
+    writer.record_episode(agent_metrics, replay_url, attributes)
 
-    # Verify data in database
-    assert writer.db is not None
-    db = writer.db
+    # Verify data in database using PostgresStatsDB
+    with PostgresStatsDB(db_url) as db:
+        # Check episode exists
+        result = db.query("SELECT id FROM episodes WHERE replay_url = %s", (replay_url,))
+        assert len(result) == 1
+        episode_id = result[0][0]
 
-    # Check episode exists
-    result = db.con.execute("SELECT id FROM episodes WHERE id = ?", (episode_id,)).fetchone()
-    assert result is not None
-    assert result[0] == episode_id
+        # Check episode attributes (stored as JSONB)
+        result = db.query("SELECT attributes FROM episodes WHERE id = %s", (episode_id,))
+        assert len(result) == 1
+        stored_attributes = result[0][0]
+        for attr, value in attributes.items():
+            assert stored_attributes[attr] == value
 
-    # Check episode attributes
-    for attr, value in attributes.items():
-        result = db.con.execute(
-            "SELECT value FROM episode_attributes WHERE episode_id = ? AND attribute = ?", (episode_id, attr)
-        ).fetchone()
-        assert result is not None
-        assert result[0] == value
+        # Check agent metrics
+        for agent_id, metrics in agent_metrics.items():
+            for metric, value in metrics.items():
+                result = db.query(
+                    "SELECT value FROM episode_agent_metrics WHERE episode_id = %s AND agent_id = %s AND metric = %s",
+                    (episode_id, agent_id, metric),
+                )
+                assert len(result) == 1
+                assert abs(result[0][0] - value) < 1e-6  # Compare floats with tolerance
 
-    # Check agent metrics
-    for agent_id, metrics in agent_metrics.items():
-        for metric, value in metrics.items():
-            result = db.con.execute(
-                "SELECT value FROM agent_metrics WHERE episode_id = ? AND agent_id = ? AND metric = ?",
-                (episode_id, agent_id, metric),
-            ).fetchone()
-            assert result is not None
-            assert abs(result[0] - value) < 1e-6  # Compare floats with tolerance
+        # Check agent policies
+        for agent_id, policy_id in agent_policies.items():
+            result = db.query(
+                "SELECT policy_id FROM episode_agent_policies WHERE episode_id = %s AND agent_id = %s",
+                (episode_id, agent_id),
+            )
+            assert len(result) == 1
+            assert result[0][0] == policy_id
 
-    # Check step count
-    result = db.con.execute("SELECT step_count FROM episodes WHERE id = ?", (episode_id,)).fetchone()
-    assert result is not None
-    assert result[0] == step_count
+        # Check eval_name and simulation_suite
+        result = db.query("SELECT eval_name, simulation_suite FROM episodes WHERE id = %s", (episode_id,))
+        assert len(result) == 1
+        assert result[0][0] == "test_eval"
+        assert result[0][1] == "test_suite"
 
-    # Check replay URL
-    result = db.con.execute("SELECT replay_url FROM episodes WHERE id = ?", (episode_id,)).fetchone()
-    assert result is not None
-    assert result[0] == replay_url
-
-    writer.close()
-
-
-def test_close_without_db(temp_dir):
-    """Test calling close() on a StatsWriter that hasn't created a DB yet."""
-    writer = StatsWriter(temp_dir)
-    assert writer.db is None
-
-    # This should not raise an error
-    writer.close()
-    assert writer.db is None
+        # Check replay URL
+        result = db.query("SELECT replay_url FROM episodes WHERE id = %s", (episode_id,))
+        assert len(result) == 1
+        assert result[0][0] == replay_url

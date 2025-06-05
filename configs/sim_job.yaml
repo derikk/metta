@@ -11,8 +11,7 @@ sim_job:
   policy_uris:
     - ${policy_uri}
   simulation_suite: ${sim}
-  stats_dir: ${run_dir}/stats
-  stats_db_uri: ${run_dir}/stats.db
   replay_dir: ${run_dir}/replays/evals
+  stats_db_uri: ???
 
 cmd: sim
