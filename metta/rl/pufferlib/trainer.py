@@ -72,7 +72,7 @@ class PufferTrainer:
         self.stats = defaultdict(list)
         self.wandb_run = wandb_run
         self.policy_store = policy_store
-        self.average_reward = 0.0
+        self._average_reward_estimate = 0.0  # Initialize for average reward RL
         self._current_eval_score = None
         self._eval_grouped_scores = {}
         self._eval_suite_avgs = {}
@@ -93,10 +93,6 @@ class PufferTrainer:
         os.makedirs(cfg.trainer.checkpoint_dir, exist_ok=True)
         checkpoint = TrainerCheckpoint.load(cfg.run_dir)
 
-        self._checkpoint_avg_reward = None
-        if checkpoint.policy_path and "average_reward" in checkpoint.extra_args:
-            self._checkpoint_avg_reward = checkpoint.extra_args["average_reward"]
-
         policy_record = None
         load_policy_attempts = 10
         while policy_record is None and load_policy_attempts > 0:
@@ -104,7 +100,7 @@ class PufferTrainer:
                 logger.info(f"Loading policy from checkpoint: {checkpoint.policy_path}")
                 policy_record = policy_store.policy(checkpoint.policy_path)
                 if "average_reward" in checkpoint.extra_args:
-                    self.average_reward = checkpoint.extra_args["average_reward"]
+                    self._average_reward_estimate = checkpoint.extra_args["average_reward"]
             elif cfg.trainer.initial_policy.uri is not None:
                 logger.info(f"Loading initial policy URI: {cfg.trainer.initial_policy.uri}")
                 policy_record = policy_store.policy(cfg.trainer.initial_policy)
@@ -466,12 +462,6 @@ class PufferTrainer:
                 # Average reward formulation: A_t = GAE(r_t - ρ, γ=1.0)
                 # where ρ is the average reward estimate
 
-                if not hasattr(self, "_average_reward_estimate"):
-                    # Initialize from checkpoint or zero
-                    self._average_reward_estimate = (
-                        self._checkpoint_avg_reward if self._checkpoint_avg_reward is not None else 0.0
-                    )
-
                 current_batch_mean = self._get_experience_buffer_mean_reward()
 
                 # Apply IIR filter (exponential moving average)
@@ -631,7 +621,7 @@ class PufferTrainer:
 
         # Save filtered average reward estimate for restart continuity
         extra_args = {}
-        if self.trainer_cfg.average_reward and hasattr(self, "_average_reward_estimate"):
+        if self.trainer_cfg.average_reward:
             extra_args["average_reward"] = self._average_reward_estimate
 
         self.checkpoint = TrainerCheckpoint(
@@ -775,7 +765,7 @@ class PufferTrainer:
                     "train/agent_step": agent_steps,
                     "train/epoch": epoch,
                     "train/learning_rate": learning_rate,
-                    "train/average_reward": self.average_reward if self.trainer_cfg.average_reward else None,
+                    "train/average_reward": self._average_reward_estimate if self.trainer_cfg.average_reward else None,
                     **timing_logs,
                 }
             )
