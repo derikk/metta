@@ -1,8 +1,11 @@
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import fastapi
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
+from psycopg.rows import class_row
+from psycopg.sql import SQL
 from pydantic import BaseModel
 
 from mettagrid.postgres_stats_db import PostgresStatsDB
@@ -41,11 +44,11 @@ class GroupDiff(BaseModel):
     group_2: str
 
 
-# Type alias for group metric
-GroupHeatmapMetric = Optional[str] | GroupDiff
+class GroupHeatmapMetric(BaseModel):
+    group_metric: str | GroupDiff
 
 
-@app.get("/api/suites")
+@app.get("/observatory/suites")
 async def get_suites() -> List[str]:
     """Get all available simulation suites."""
     with PostgresStatsDB(stats_db_uri) as db:
@@ -58,7 +61,7 @@ async def get_suites() -> List[str]:
         return [row[0] for row in result]
 
 
-@app.get("/api/metrics/{suite}")
+@app.get("/observatory/suites/{suite}/metrics")
 async def get_metrics(suite: str) -> List[str]:
     """Get all available metrics for a given suite."""
     with PostgresStatsDB(stats_db_uri) as db:
@@ -75,7 +78,7 @@ async def get_metrics(suite: str) -> List[str]:
         return [row[0] for row in result]
 
 
-@app.get("/api/group-ids/{suite}")
+@app.get("/observatory/suites/{suite}/group-ids")
 async def get_group_ids(suite: str) -> List[str]:
     """Get all available group IDs for a given suite."""
     with PostgresStatsDB(stats_db_uri) as db:
@@ -91,259 +94,107 @@ async def get_group_ids(suite: str) -> List[str]:
         return [row[0] for row in result]
 
 
-@app.get("/api/heatmap-data/{suite}/{metric}")
-async def get_heatmap_data(suite: str, metric: str, group_metric: Optional[str] = None) -> HeatmapData:
+@app.post("/observatory/suites/{suite}/metrics/{metric}/heatmap")
+async def get_heatmap_data(
+    suite: str,
+    metric: str,
+    group_metric: GroupHeatmapMetric,
+) -> HeatmapData:
     """Get heatmap data for a given suite, metric, and group metric."""
+    with PostgresStatsDB(db_url=stats_db_uri) as db:
+        eval_rows = db.query("SELECT DISTINCT eval_name FROM episodes WHERE simulation_suite = %s", (suite,))
+        all_eval_names: list[str] = [row[0] for row in eval_rows]
 
-    with PostgresStatsDB(stats_db_uri) as db:
-        # Get all episodes for the suite with their data
-        result = db.query(
-            """
-            SELECT
-                p.name as policy_uri,
-                e.eval_name,
-                e.replay_url,
-                e.attributes->'agent_groups' as agent_groups,
-                eam.agent_id,
-                eam.metric,
-                eam.value
-            FROM episodes e
-            JOIN episode_agent_policies eap ON e.id = eap.episode_id
-            JOIN policies p ON eap.policy_id = p.id
-            JOIN episode_agent_metrics eam ON e.id = eam.episode_id
-            WHERE e.simulation_suite = %s AND eam.metric = %s
-            ORDER BY p.name, e.eval_name, eam.agent_id
-        """,
-            (suite, metric),
-        )
+        if isinstance(group_metric.group_metric, GroupDiff):
+            group1_rows = get_group_data(db, suite, metric, group_metric.group_metric.group_1)
+            group2_rows = get_group_data(db, suite, metric, group_metric.group_metric.group_2)
+        else:
+            group1_rows = get_group_data(db, suite, metric, group_metric.group_metric)
+            group2_rows: List[GroupDataRow] = []
 
-        # Process the data to match the frontend structure
-        eval_names = set()
-        policy_uris = set()
-        cells_data = {}
+        all_policy_uris: set[str] = set()
+        for row in group1_rows:
+            all_policy_uris.add(row.policy_uri)
+        for row in group2_rows:
+            all_policy_uris.add(row.policy_uri)
 
-        # Group by policy and eval
-        for row in result:
-            policy_uri, eval_name, replay_url, agent_groups, agent_id, metric_name, value = row
-            eval_names.add(eval_name)
-            policy_uris.add(policy_uri)
+        group_1_values: Dict[Tuple[str, str], Tuple[float, str | None]] = {}
+        group_2_values: Dict[Tuple[str, str], Tuple[float, str | None]] = {}
+        for row in group1_rows:
+            group_1_values[(row.policy_uri, row.eval_name)] = (row.total_value / row.num_agents, row.replay_url)
+        for row in group2_rows:
+            group_2_values[(row.policy_uri, row.eval_name)] = (row.total_value / row.num_agents, row.replay_url)
 
-            key = f"{policy_uri}-{eval_name}"
-            if key not in cells_data:
-                cells_data[key] = {
-                    "policy_uri": policy_uri,
-                    "eval_name": eval_name,
-                    "replay_url": replay_url,
-                    "agent_groups": agent_groups,
-                    "metrics": {},
-                }
-
-            # Store metric value by agent
-            if agent_id not in cells_data[key]["metrics"]:
-                cells_data[key]["metrics"][agent_id] = value
-
-        # Calculate heatmap cells
-        cells = {}
-        eval_names_list = sorted(list(eval_names))
-
-        for policy_uri in sorted(policy_uris):
+        cells: Dict[str, Dict[str, HeatmapCell]] = {}
+        for policy_uri in all_policy_uris:
             cells[policy_uri] = {}
+            for eval_name in all_eval_names:
+                group_1_value = group_1_values.get((policy_uri, eval_name), (0, None))
+                group_2_value = group_2_values.get((policy_uri, eval_name), (0, None))
 
-            for eval_name in eval_names_list:
-                key = f"{policy_uri}-{eval_name}"
-                cell_data = cells_data.get(key)
+                cells[policy_uri][eval_name] = HeatmapCell(
+                    evalName=eval_name,
+                    replayUrl=group_1_value[1] if group_1_value[1] is not None else group_2_value[1],
+                    value=group_1_value[0] - group_2_value[0],
+                )
 
-                if cell_data:
-                    # Calculate value based on group_metric
-                    value = calculate_cell_value_with_group_diff(cell_data, group_metric)
-                    cells[policy_uri][eval_name] = HeatmapCell(
-                        evalName=eval_name, replayUrl=cell_data["replay_url"], value=value
-                    )
-                else:
-                    # No data for this policy-eval combination
-                    cells[policy_uri][eval_name] = HeatmapCell(evalName=eval_name, replayUrl=None, value=0.0)
-
-        # Calculate averages and max scores
-        policy_average_scores = {}
-        eval_average_scores = {}
-        eval_max_scores = {}
-
-        # Policy averages
-        for policy_uri in cells:
-            policy_values = [cell.value for cell in cells[policy_uri].values()]
-            policy_average_scores[policy_uri] = sum(policy_values) / len(policy_values)
-
-        # Eval averages and max scores
-        for eval_name in eval_names_list:
-            eval_values = [cells[policy_uri][eval_name].value for policy_uri in cells]
-            eval_average_scores[eval_name] = sum(eval_values) / len(eval_values)
-            eval_max_scores[eval_name] = max(eval_values)
+        policy_average_scores: Dict[str, float] = {}
+        for policy_uri in all_policy_uris:
+            policy_cells = cells[policy_uri]
+            policy_average_scores[policy_uri] = sum(cell.value for cell in policy_cells.values()) / len(policy_cells)
 
         return HeatmapData(
-            evalNames=eval_names_list,
+            evalNames=all_eval_names,
             cells=cells,
             policyAverageScores=policy_average_scores,
-            evalAverageScores=eval_average_scores,
-            evalMaxScores=eval_max_scores,
+            evalAverageScores={},
+            evalMaxScores={},
         )
 
 
-def calculate_cell_value_with_group_diff(cell_data: Dict[str, Any], group_metric: Optional[str | GroupDiff]) -> float:
-    """Calculate the cell value based on group metric and agent data, supporting GroupDiff."""
-    agent_groups = cell_data["agent_groups"] or {}
-    metrics = cell_data["metrics"]
-
-    if group_metric is None:
-        # Sum all agents' values and divide by total agent count
-        total_value = sum(metrics.values())
-        total_agents = len(metrics)
-        return total_value / total_agents if total_agents > 0 else 0.0
-
-    # Handle GroupDiff
-    if isinstance(group_metric, GroupDiff):
-        # Calculate average for group_1
-        group1_agents = []
-        for agent_id, group_id in agent_groups.items():
-            if group_id == group_metric.group_1:
-                group1_agents.append(agent_id)
-
-        group1_value = 0.0
-        if group1_agents:
-            group1_values = [metrics.get(agent_id, 0) for agent_id in group1_agents]
-            group1_value = sum(group1_values) / len(group1_values)
-
-        # Calculate average for group_2
-        group2_agents = []
-        for agent_id, group_id in agent_groups.items():
-            if group_id == group_metric.group_2:
-                group2_agents.append(agent_id)
-
-        group2_value = 0.0
-        if group2_agents:
-            group2_values = [metrics.get(agent_id, 0) for agent_id in group2_agents]
-            group2_value = sum(group2_values) / len(group2_values)
-
-        # Return difference: group1 - group2
-        return group1_value - group2_value
-
-    # Handle string group metric (fallback)
-    if isinstance(group_metric, str):
-        if group_metric == "":
-            # Sum all agents' values and divide by total agent count
-            total_value = sum(metrics.values())
-            total_agents = len(metrics)
-            return total_value / total_agents if total_agents > 0 else 0.0
-
-        # Single group: sum values for agents in that group
-        group_agents = []
-        for agent_id, group_id in agent_groups.items():
-            if group_id == group_metric:
-                group_agents.append(agent_id)
-
-        if not group_agents:
-            return 0.0
-
-        group_values = [metrics.get(agent_id, 0) for agent_id in group_agents]
-        return sum(group_values) / len(group_values)
-
-    return 0.0
+@dataclass
+class GroupDataRow:
+    policy_uri: str
+    eval_name: str
+    replay_url: str | None
+    num_agents: int
+    total_value: float
 
 
-@app.post("/api/heatmap-data/{suite}/{metric}")
-async def get_heatmap_data_post(suite: str, metric: str, group_metric: Optional[GroupDiff] = None) -> HeatmapData:
-    """Get heatmap data for a given suite, metric, and group metric (supports GroupDiff)."""
-
-    with PostgresStatsDB(stats_db_uri) as db:
-        # Get all episodes for the suite with their data
-        result = db.query(
-            """
+def get_group_data(db: PostgresStatsDB, suite: str, metric: str, group: str) -> List[GroupDataRow]:
+    query_template: SQL = SQL("""
+        WITH episode_agent_metrics_with_group_id AS (
             SELECT
-                p.name as policy_uri,
-                e.eval_name,
-                e.replay_url,
-                e.attributes->'agent_groups' as agent_groups,
-                eam.agent_id,
-                eam.metric,
-                eam.value
-            FROM episodes e
-            JOIN episode_agent_policies eap ON e.id = eap.episode_id
-            JOIN policies p ON eap.policy_id = p.id
-            JOIN episode_agent_metrics eam ON e.id = eam.episode_id
+                eam.*,
+                CAST ((e.attributes->'agent_groups')[eam.agent_id] AS INTEGER) as group_id
+            FROM episode_agent_metrics eam
+            JOIN episodes e ON e.id = eam.episode_id
             WHERE e.simulation_suite = %s AND eam.metric = %s
-            ORDER BY p.name, e.eval_name, eam.agent_id
-        """,
-            (suite, metric),
         )
 
-        # Process the data to match the frontend structure
-        eval_names = set()
-        policy_uris = set()
-        cells_data = {}
+        SELECT
+          p.name as policy_uri,
+          e.eval_name,
+          ANY_VALUE(e.replay_url) as replay_url,
+          COUNT(*) AS num_agents,
+          SUM(eam.value) AS total_value
+        FROM episode_agent_metrics_with_group_id eam
+        JOIN episodes e ON e.id = eam.episode_id
+        JOIN policies p ON e.primary_policy_id = p.id
+        {}
+        GROUP BY p.name, e.eval_name
+    """)
 
-        # Group by policy and eval
-        for row in result:
-            policy_uri, eval_name, replay_url, agent_groups, agent_id, metric_name, value = row
-            eval_names.add(eval_name)
-            policy_uris.add(policy_uri)
+    where_clause = SQL("")
+    if group != "":
+        where_clause = SQL("WHERE eam.group_id = %s")
 
-            key = f"{policy_uri}-{eval_name}"
-            if key not in cells_data:
-                cells_data[key] = {
-                    "policy_uri": policy_uri,
-                    "eval_name": eval_name,
-                    "replay_url": replay_url,
-                    "agent_groups": agent_groups,
-                    "metrics": {},
-                }
+    query = query_template.format(where_clause)
+    params = (suite, metric, group) if group != "" else (suite, metric)
 
-            # Store metric value by agent
-            if agent_id not in cells_data[key]["metrics"]:
-                cells_data[key]["metrics"][agent_id] = value
-
-        # Calculate heatmap cells
-        cells = {}
-        eval_names_list = sorted(list(eval_names))
-
-        for policy_uri in sorted(policy_uris):
-            cells[policy_uri] = {}
-
-            for eval_name in eval_names_list:
-                key = f"{policy_uri}-{eval_name}"
-                cell_data = cells_data.get(key)
-
-                if cell_data:
-                    # Calculate value based on group_metric
-                    value = calculate_cell_value_with_group_diff(cell_data, group_metric)
-                    cells[policy_uri][eval_name] = HeatmapCell(
-                        evalName=eval_name, replayUrl=cell_data["replay_url"], value=value
-                    )
-                else:
-                    # No data for this policy-eval combination
-                    cells[policy_uri][eval_name] = HeatmapCell(evalName=eval_name, replayUrl=None, value=0.0)
-
-        # Calculate averages and max scores
-        policy_average_scores = {}
-        eval_average_scores = {}
-        eval_max_scores = {}
-
-        # Policy averages
-        for policy_uri in cells:
-            policy_values = [cell.value for cell in cells[policy_uri].values()]
-            policy_average_scores[policy_uri] = sum(policy_values) / len(policy_values)
-
-        # Eval averages and max scores
-        for eval_name in eval_names_list:
-            eval_values = [cells[policy_uri][eval_name].value for policy_uri in cells]
-            eval_average_scores[eval_name] = sum(eval_values) / len(eval_values)
-            eval_max_scores[eval_name] = max(eval_values)
-
-        return HeatmapData(
-            evalNames=eval_names_list,
-            cells=cells,
-            policyAverageScores=policy_average_scores,
-            evalAverageScores=eval_average_scores,
-            evalMaxScores=eval_max_scores,
-        )
+    with db.con.cursor(row_factory=class_row(GroupDataRow)) as cursor:
+        cursor.execute(query, params)
+        return cursor.fetchall()
 
 
 if __name__ == "__main__":

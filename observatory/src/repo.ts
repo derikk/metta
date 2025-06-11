@@ -77,15 +77,15 @@ export class ServerRepo implements Repo {
   }
 
   async getSuites(): Promise<string[]> {
-    return this.apiCall<string[]>("/api/suites");
+    return this.apiCall<string[]>("/observatory/suites");
   }
 
   async getMetrics(suite: string): Promise<string[]> {
-    return this.apiCall<string[]>(`/api/metrics/${encodeURIComponent(suite)}`);
+    return this.apiCall<string[]>(`/observatory/suites/${encodeURIComponent(suite)}/metrics`);
   }
 
   async getGroupIds(suite: string): Promise<string[]> {
-    return this.apiCall<string[]>(`/api/group-ids/${encodeURIComponent(suite)}`);
+    return this.apiCall<string[]>(`/observatory/suites/${encodeURIComponent(suite)}/group-ids`);
   }
 
   async getHeatmapData(metric: string, suite: string, groupMetric: GroupHeatmapMetric): Promise<HeatmapData> {
@@ -133,24 +133,14 @@ export class ServerRepo implements Repo {
     };
 
     // Handle different group metric types
-    if (typeof groupMetric === "string") {
-      // Use GET endpoint for string group metrics
-      const params = new URLSearchParams();
-      if (groupMetric !== "") {
-        params.append("group_metric", groupMetric);
-      }
-      const endpoint = `/api/heatmap-data/${encodeURIComponent(suite)}/${encodeURIComponent(metric)}`;
-      const fullEndpoint = params.toString() ? `${endpoint}?${params.toString()}` : endpoint;
-      const apiData = await this.apiCall<ApiHeatmapData>(fullEndpoint);
-      return convertApiResponse(apiData);
-    } else {
+
       // Use POST endpoint for GroupDiff
       const apiData = await this.apiCallWithBody<ApiHeatmapData>(
-        `/api/heatmap-data/${encodeURIComponent(suite)}/${encodeURIComponent(metric)}`,
+        `/observatory/suites/${encodeURIComponent(suite)}/metrics/${encodeURIComponent(metric)}/heatmap`,
         { group_metric: groupMetric }
       );
       return convertApiResponse(apiData);
-    }
+
   }
 }
 

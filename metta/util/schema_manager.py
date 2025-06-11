@@ -1,9 +1,9 @@
 import abc
-
 from datetime import datetime
 from typing import List, LiteralString, Sequence
-from pydantic import BaseModel
+
 from psycopg import Connection, sql
+from pydantic import BaseModel
 
 
 class Migration(abc.ABC):
