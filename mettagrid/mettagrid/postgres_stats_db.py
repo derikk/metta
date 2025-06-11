@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, LiteralString, Sequence, Tuple
 
 from psycopg import Connection
+from psycopg.abc import Query
 from psycopg.rows import TupleRow
 from psycopg.types.json import Jsonb
 
@@ -47,6 +48,7 @@ EVAL_MIGRATIONS = [
             """CREATE TABLE episodes (
                 id SERIAL PRIMARY KEY,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                primary_policy_id INTEGER NOT NULL REFERENCES policies(id),
                 replay_url TEXT,
                 eval_name TEXT,
                 simulation_suite TEXT,
@@ -82,7 +84,7 @@ class PostgresStatsDB:
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.con.close()
 
-    def query(self, query: LiteralString, params: Tuple[Any, ...] = ()) -> Sequence[TupleRow]:
+    def query(self, query: Query, params: Tuple[Any, ...] = ()) -> Sequence[TupleRow]:
         with self.con.cursor() as cur:
             cur.execute(query, params)
             return cur.fetchall()
@@ -160,6 +162,7 @@ class PostgresStatsDB:
         self,
         agent_policies: Dict[int, int],
         agent_metrics: Dict[int, Dict[str, float]],
+        primary_policy_id: int,
         eval_name: str | None,
         simulation_suite: str | None,
         replay_url: str | None,
@@ -173,15 +176,17 @@ class PostgresStatsDB:
                     replay_url,
                     eval_name,
                     simulation_suite,
+                    primary_policy_id,
                     attributes
                 ) VALUES (
-                    %s, %s, %s, %s
+                    %s, %s, %s, %s, %s
                 ) RETURNING id
                 """,
                 (
                     replay_url,
                     eval_name,
                     simulation_suite,
+                    primary_policy_id,
                     Jsonb(attributes),
                 ),
             )

@@ -28,7 +28,8 @@ class StatsWriter:
     # TODO: This is hacky, but the reason we set separately instead of in the constructor is that we need to build
     # mettagrid env to get the agent policies, and we are passing the stats_writer to the vecenv.
     # We should refactor this to not need to do this.
-    def set_agent_policies(self, agent_policies: Dict[int, int]) -> None:
+    def set_agent_policies(self, primary_policy_id: int, agent_policies: Dict[int, int]) -> None:
+        self.primary_policy_id = primary_policy_id
         self.agent_policies = agent_policies
 
     def record_episode(
@@ -41,6 +42,7 @@ class StatsWriter:
             db.record_episode(
                 agent_policies=self.agent_policies,
                 agent_metrics=agent_metrics,
+                primary_policy_id=self.primary_policy_id,
                 eval_name=self.eval_name,
                 simulation_suite=self.simulation_suite,
                 replay_url=replay_url,

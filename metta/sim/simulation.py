@@ -14,7 +14,7 @@ import logging
 import os
 import time
 import uuid
-from typing import Dict
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -42,36 +42,34 @@ class SimulationCompatibilityError(Exception):
     pass
 
 
-def get_agent_policies(
-    stats_db_url: str,
-    policy_idxs: torch.Tensor,
-    npc_idxs: torch.Tensor,
-    policy_pr: PolicyRecord,
-    npc_pr: PolicyRecord | None,
-) -> Dict[int, int]:
+def get_policy_ids(stats_db_url: str, policy_names: List[str]) -> Dict[str, int]:
     with PostgresStatsDB(stats_db_url) as db:
-        policy_names = [policy_pr.name]
-        if npc_pr is not None:
-            policy_names.append(npc_pr.name)
         policy_ids = db.get_policy_ids(policy_names)
-
         for policy_name in policy_names:
             if policy_name not in policy_ids:
                 policy_id = db.create_policy(policy_name, None, None, None)
                 policy_ids[policy_name] = policy_id
+        return policy_ids
 
-        agent_map: Dict[int, int] = {}
 
-        # Add policy agents to the map
-        for idx in policy_idxs:
-            agent_map[int(idx.item())] = policy_ids[policy_pr.name]
+def get_agent_policies(
+    policy_idxs: torch.Tensor,
+    npc_idxs: torch.Tensor,
+    policy_id: int,
+    npc_policy_id: int | None,
+) -> Dict[int, int]:
+    agent_map: Dict[int, int] = {}
 
-        # Add NPC agents to the map if they exist
-        if npc_pr is not None:
-            for idx in npc_idxs:
-                agent_map[int(idx.item())] = policy_ids[npc_pr.name]
+    # Add policy agents to the map
+    for idx in policy_idxs:
+        agent_map[int(idx.item())] = policy_id
 
-        return agent_map
+    # Add NPC agents to the map if they exist
+    if npc_policy_id is not None:
+        for idx in npc_idxs:
+            agent_map[int(idx.item())] = npc_policy_id
+
+    return agent_map
 
 
 class Simulation:
@@ -177,15 +175,21 @@ class Simulation:
         self._episode_counters = np.zeros(self._num_envs, dtype=int)
 
         if self._stats_writer is not None:
-            self._stats_writer.set_agent_policies(
-                get_agent_policies(
-                    stats_db_url=self._stats_writer.db_url,
-                    policy_idxs=self._policy_idxs,
-                    npc_idxs=self._npc_idxs,
-                    policy_pr=self._policy_pr,
-                    npc_pr=self._npc_pr,
-                )
+            policy_names = [self._policy_pr.name]
+            if self._npc_pr is not None:
+                policy_names.append(self._npc_pr.name)
+            policy_ids = get_policy_ids(self._stats_writer.db_url, policy_names)
+            policy_id = policy_ids[self._policy_pr.name]
+            npc_policy_id = policy_ids[self._npc_pr.name] if self._npc_pr is not None else None
+
+            agent_policies = get_agent_policies(
+                policy_idxs=self._policy_idxs,
+                npc_idxs=self._npc_idxs,
+                policy_id=policy_id,
+                npc_policy_id=npc_policy_id,
             )
+
+            self._stats_writer.set_agent_policies(primary_policy_id=policy_id, agent_policies=agent_policies)
 
     def start_simulation(self) -> None:
         """
