@@ -406,23 +406,6 @@ class MettaTrainer:
             mask = torch.as_tensor(mask)
             num_steps = mask.sum().item()
             self.agent_step += num_steps * self._world_size
-
-            # Debug logging for first few iterations
-            if self.epoch == 0 and hasattr(self, "_rollout_debug_count"):
-                if self._rollout_debug_count < 5:
-                    logger.info(
-                        f"Rollout debug {self._rollout_debug_count}: mask={mask}, num_steps={num_steps}, env_id={env_id}"
-                    )
-                    self._rollout_debug_count += 1
-            elif self.epoch == 0:
-                self._rollout_debug_count = 0
-
-            # Always log if we're getting zero steps
-            if num_steps == 0 and rollout_iterations <= 3:
-                logger.warning(
-                    f"Rollout iteration {rollout_iterations}: Got 0 steps! mask shape={mask.shape if hasattr(mask, 'shape') else len(mask)}, mask sum={mask.sum() if hasattr(mask, 'sum') else sum(mask)}"
-                )
-
             total_steps_collected += num_steps
 
             # Convert to tensors once
