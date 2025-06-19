@@ -45,7 +45,7 @@ run: |
   exec bash
 
 envs:
-  METTA_GIT_REF: main
+  METTA_GIT_REF: richard-long-run-training
   WANDB_DIR: ./wandb
 
   # username and password are acquired automatically by our skypilot-api-server patch, see skypilot-chart/files/ecr.patch
