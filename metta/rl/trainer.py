@@ -2,6 +2,7 @@ import logging
 import os
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from typing import Any, Dict, Set
 from uuid import UUID
 
@@ -50,24 +51,6 @@ torch.set_float32_matmul_precision("high")
 rank = int(os.environ.get("RANK", 0))
 local_rank = int(os.environ.get("LOCAL_RANK", 0))
 logger = logging.getLogger(f"trainer-{rank}-{local_rank}")
-
-
-def dist_sum(value: float | int, device: torch.device | str) -> float:
-    """Sum a value across all distributed processes."""
-    if not torch.distributed.is_initialized():
-        return value
-
-    tensor = torch.tensor(value, device=device)
-    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
-    return tensor.item()
-
-
-def dist_mean(value: float | int, device: torch.device | str) -> float:
-    """Average a value across all distributed processes."""
-    if not torch.distributed.is_initialized():
-        return value
-
-    return dist_sum(value, device) / torch.distributed.get_world_size()
 
 
 class MettaTrainer:
@@ -379,19 +362,13 @@ class MettaTrainer:
         experience = self.experience
         trainer_cfg = self.trainer_cfg
         device = self.device
-        use_rnn = trainer_cfg.get("use_rnn", True)
 
         policy = self.policy
         infos = defaultdict(list)
         raw_infos = []  # Collect raw info for batch processing later
         experience.reset_for_rollout()
 
-        rollout_iterations = 0
-        total_steps_collected = 0
-
         while not experience.ready_for_training:
-            rollout_iterations += 1
-
             with self.timer("_rollout.env"):
                 o, r, d, t, info, env_id, mask = self.vecenv.recv()
                 if trainer_cfg.require_contiguous_env_ids:
@@ -406,12 +383,9 @@ class MettaTrainer:
             mask = torch.as_tensor(mask)
             num_steps = mask.sum().item()
             self.agent_step += num_steps * self._world_size
-            total_steps_collected += num_steps
 
             # Convert to tensors once
-            o = torch.as_tensor(o)
-            # Move to device non-blocking for all tensors that need it
-            o_device = o.to(device, non_blocking=True) if not trainer_cfg.cpu_offload else o
+            o = torch.as_tensor(o).to(device, non_blocking=True)
             r = torch.as_tensor(r).to(device, non_blocking=True)
             d = torch.as_tensor(d).to(device, non_blocking=True)
             t = torch.as_tensor(t).to(device, non_blocking=True)
@@ -419,25 +393,22 @@ class MettaTrainer:
             with torch.no_grad():
                 state = PolicyState()
 
-                # Use direct LSTM state access for performance
-                if use_rnn:
-                    lstm_h, lstm_c = experience.get_lstm_state_direct(training_env_id.start)
-                    if lstm_h is not None:
-                        state.lstm_h = lstm_h
-                        state.lstm_c = lstm_c
+                # Use LSTM state access for performance
+                lstm_h, lstm_c = experience.get_lstm_state(training_env_id.start)
+                if lstm_h is not None:
+                    state.lstm_h = lstm_h
+                    state.lstm_c = lstm_c
 
                 # Use pre-moved tensor
-                obs_for_policy = o_device if not trainer_cfg.cpu_offload else o.to(device, non_blocking=True)
-                actions, selected_action_log_probs, _, value, _ = policy(obs_for_policy, state)
+                actions, selected_action_log_probs, _, value, _ = policy(o, state)
 
                 if __debug__:
                     assert_shape(selected_action_log_probs, ("BT",), "selected_action_log_probs")
                     assert_shape(actions, ("BT", 2), "actions")
 
-                # Store LSTM state directly for performance
+                # Store LSTM state for performance
                 lstm_state_to_store = None
-                if use_rnn and state.lstm_h is not None:
-                    experience.set_lstm_state_direct(training_env_id.start, state.lstm_h, state.lstm_c)
+                if state.lstm_h is not None:
                     lstm_state_to_store = {"lstm_h": state.lstm_h, "lstm_c": state.lstm_c}
 
                 if str(self.device).startswith("cuda"):
@@ -448,7 +419,7 @@ class MettaTrainer:
 
             # All tensors are already on device, avoid redundant transfers
             experience.store(
-                obs=o if trainer_cfg.cpu_offload else o_device,
+                obs=o,
                 actions=actions,
                 logprobs=selected_action_log_probs,
                 rewards=r,
@@ -460,21 +431,21 @@ class MettaTrainer:
                 lstm_state=lstm_state_to_store,
             )
 
+            # At this point, infos contains lists of values collected across:
+            # 1. Multiple vectorized environments managed by this GPU's vecenv
+            # 2. Multiple rollout steps (until experience buffer is full)
+            #
+            # - Some stats (like "episode/reward") appear only when episodes complete
+            # - Other stats might appear every step
+            #
+            # These will later be averaged in _process_stats() to get mean values
+            # across all environments on this GPU. Stats from other GPUs (if using
+            # distributed training) are handled separately and not aggregated here.
             if info:
                 raw_infos.extend(info)
 
-            # Debug experience buffer state
-            if hasattr(self, "_rollout_debug_count") and self._rollout_debug_count < 3:
-                logger.info(
-                    f"Experience buffer state: full_rows={experience.full_rows}, segments={experience.segments}, ready={experience.ready_for_training}"
-                )
-
             with self.timer("_rollout.env"):
                 self.vecenv.send(actions.cpu().numpy().astype(dtype_actions))
-
-        # Log rollout summary
-        if total_steps_collected == 0:
-            logger.error(f"Rollout completed with 0 total steps after {rollout_iterations} iterations!")
 
         # Batch process info dictionaries after rollout
         for i in raw_infos:
@@ -552,8 +523,6 @@ class MettaTrainer:
                 )
 
                 obs = minibatch["obs"]
-                if not trainer_cfg.get("use_rnn", True):
-                    obs = obs.reshape(-1, *self.vecenv.single_observation_space.shape)
 
                 lstm_state = PolicyState()
                 _, new_logprobs, entropy, newvalue, full_logprobs = self.policy(
@@ -784,7 +753,7 @@ class MettaTrainer:
 
     @with_instance_timer("_process_stats")
     def _process_stats(self):
-        if not self.wandb_run or not self._master:
+        if not self._master or not self.wandb_run:
             self.stats.clear()
             return
 
@@ -814,19 +783,25 @@ class MettaTrainer:
         wall_time = self.timer.get_elapsed()
         train_time = elapsed_times.get("_rollout", 0) + elapsed_times.get("_train", 0)
 
-        # X-axis values for wandb
-        # Agent steps should be summed across GPUs (each GPU processes part of the batch)
-        # But epoch should be the same on all GPUs, so no aggregation needed
-        total_agent_steps = dist_sum(self.agent_step, self.device)
+        lap_times = self.timer.lap_all(self.agent_step)
+        wall_time_for_lap = lap_times.pop("global", 0)
 
+        delta_steps = self.timer.get_lap_steps()
+        if delta_steps is None:
+            delta_steps = self.agent_step
+        lap_steps_per_second = delta_steps / wall_time_for_lap if wall_time_for_lap > 0 else 0
+        steps_per_second = self.timer.get_rate(self.agent_step) if wall_time > 0 else 0
+
+        # Approximate total values by multiplying by world size
+        total_agent_steps = self.agent_step * self._world_size
+
+        # X-axis values for wandb
         metric_stats = {
             "metric/step": total_agent_steps,
-            "metric/epoch": self.epoch,  # Same on all GPUs, no need to sum
+            "metric/epoch": self.epoch,
             "metric/total_time": wall_time,
             "metric/train_time": train_time,
         }
-        lap_times = self.timer.lap_all(self.agent_step)
-        wall_time_for_lap = lap_times.pop("global", 0)
 
         timing_stats = {
             **{
@@ -838,18 +813,8 @@ class MettaTrainer:
                 for op, elapsed in elapsed_times.items()
             },
         }
-
-        delta_steps = self.timer.get_lap_steps()
-        if delta_steps is None:
-            delta_steps = self.agent_step
-
-        # Aggregate steps per second across all GPUs
-        lap_steps_per_second = delta_steps / wall_time_for_lap if wall_time_for_lap > 0 else 0
-        steps_per_second = self.timer.get_rate(self.agent_step) if wall_time > 0 else 0
-
-        # Sum SPS across all distributed processes
-        total_sps = dist_sum(steps_per_second, self.device)
-        total_lap_sps = dist_sum(lap_steps_per_second, self.device)
+        total_sps = steps_per_second * self._world_size
+        total_lap_sps = lap_steps_per_second * self._world_size
 
         mean_reward = self.experience.get_mean_reward()
         overview = {
@@ -928,17 +893,20 @@ class MettaTrainer:
         tensors = [t.to(device) for t in tensors]
         values, rewards, dones, importance_sampling_ratio, advantages = tensors
 
-        torch.ops.pufferlib.compute_puff_advantage(
-            values,
-            rewards,
-            dones,
-            importance_sampling_ratio,
-            advantages,
-            gamma,
-            gae_lambda,
-            vtrace_rho_clip,
-            vtrace_c_clip,
-        )
+        # Create context manager that only applies CUDA device context if needed
+        device_context = torch.cuda.device(device) if str(device).startswith("cuda") else nullcontext()
+        with device_context:
+            torch.ops.pufferlib.compute_puff_advantage(
+                values,
+                rewards,
+                dones,
+                importance_sampling_ratio,
+                advantages,
+                gamma,
+                gae_lambda,
+                vtrace_rho_clip,
+                vtrace_c_clip,
+            )
 
         return advantages
 
@@ -995,8 +963,7 @@ class MettaTrainer:
         minibatch_size = trainer_cfg.minibatch_size
         max_minibatch_size = trainer_cfg.get("max_minibatch_size", minibatch_size)
 
-        # Get LSTM parameters if using RNN
-        use_rnn = trainer_cfg.get("use_rnn", True)
+        # Get LSTM parameters
         hidden_size = getattr(self.policy, "hidden_size", 256)
         num_lstm_layers = 2  # Default value
 
@@ -1005,18 +972,6 @@ class MettaTrainer:
             lstm_module = self.policy.components["_core_"]
             if hasattr(lstm_module, "_net") and hasattr(lstm_module._net, "num_layers"):
                 num_lstm_layers = lstm_module._net.num_layers
-
-        # Validate batch size
-        required_segments = total_agents
-        actual_segments = self._batch_size // trainer_cfg.bptt_horizon
-
-        if total_agents > actual_segments:
-            min_required_batch_size = total_agents * trainer_cfg.bptt_horizon
-            raise ValueError(
-                f"batch_size ({self._batch_size}) is too small for {total_agents} agents.\n"
-                f"With bptt_horizon={trainer_cfg.bptt_horizon}, you need at least batch_size={min_required_batch_size}.\n"
-                f"Please update your configuration file to set trainer.batch_size >= {min_required_batch_size}"
-            )
 
         # Create experience buffer
         self.experience = Experience(
@@ -1028,7 +983,6 @@ class MettaTrainer:
             obs_space=obs_space,
             atn_space=atn_space,
             device=self.device,
-            use_rnn=use_rnn,
             hidden_size=hidden_size,
             cpu_offload=trainer_cfg.cpu_offload,
             num_lstm_layers=num_lstm_layers,
@@ -1046,16 +1000,6 @@ class MettaTrainer:
             self.target_batch_size = 2
 
         self.batch_size = (self.target_batch_size // trainer_cfg.num_workers) * trainer_cfg.num_workers
-
-        # Validation to catch configuration issues early
-        if self.batch_size < 1:
-            raise ValueError(
-                f"Calculated batch_size is {self.batch_size}, which is less than 1!\n"
-                f"This typically happens when forward_pass_minibatch_target_size ({trainer_cfg.forward_pass_minibatch_target_size}) "
-                f"is too small for the number of agents ({num_agents}) in the environment.\n"
-                f"Try increasing trainer.forward_pass_minibatch_target_size to at least {num_agents * 2}"
-            )
-
         logger.info(f"forward_pass_batch_size: {self.batch_size}")
 
         num_envs = self.batch_size * trainer_cfg.async_factor
@@ -1083,15 +1027,6 @@ class MettaTrainer:
         # processes generate uncorrelated environments in distributed training
         rank = int(os.environ.get("RANK", 0))
         self.vecenv.async_reset(self.cfg.seed + rank)
-
-        # Debug logging
-        logger.info("VecEnv initialized:")
-        logger.info(f"  - num_agents: {self.vecenv.num_agents}")
-        logger.info(f"  - num_envs: {num_envs}")
-        logger.info(f"  - batch_size: {self.batch_size}")
-        logger.info(f"  - forward_pass_minibatch_target_size: {trainer_cfg.forward_pass_minibatch_target_size}")
-        logger.info(f"  - async_factor: {trainer_cfg.async_factor}")
-        logger.info(f"  - num_workers: {trainer_cfg.num_workers}")
 
     def _load_policy(self, checkpoint, policy_store, metta_grid_env):
         """Load policy from checkpoint, initial_policy.uri, or create new."""
