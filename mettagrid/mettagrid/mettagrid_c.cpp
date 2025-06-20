@@ -42,6 +42,14 @@ MettaGrid::MettaGrid(py::dict cfg, py::list map) {
   _num_observation_tokens =
       cfg.contains("num_observation_tokens") ? cfg["num_observation_tokens"].cast<unsigned int>() : 0;
 
+  // Check if detailed stats tracking should be disabled (to prevent memory leaks)
+  bool disable_detailed_stats =
+      cfg.contains("disable_detailed_stats") ? cfg["disable_detailed_stats"].cast<bool>() : false;
+  if (disable_detailed_stats) {
+    // TODO: Implement a flag to disable detailed stats tracking in StatsTracker
+    // For now, the MAX_KEYS limit in StatsTracker will prevent unbounded growth
+  }
+
   current_step = 0;
 
   std::vector<Layer> layer_for_type_id;
@@ -193,6 +201,12 @@ MettaGrid::~MettaGrid() {
     _event_manager->clear_events();
   }
 
+  // Clear grid objects to ensure all objects (agents, converters, etc) are destroyed
+  // This will trigger the destructors of all unique_ptr<GridObject> in the grid
+  if (_grid) {
+    _grid->objects.clear();
+  }
+
   // Clear the non-owning agent pointers
   // The actual Agent objects are owned and destroyed by _grid
   _agents.clear();
@@ -333,7 +347,9 @@ void MettaGrid::_compute_observations(py::array_t<ActionType, py::array::c_style
 void MettaGrid::_handle_invalid_action(size_t agent_idx, const std::string& stat, ActionType type, ActionArg arg) {
   auto& agent = _agents[agent_idx];
   agent->stats.incr(stat);
-  agent->stats.incr(stat + "." + std::to_string(type) + "." + std::to_string(arg));
+  // NOTE: Disabled detailed tracking to prevent memory leak from unbounded key growth
+  // Each unique type/arg combination creates a new permanent entry in the stats maps
+  // agent->stats.incr(stat + "." + std::to_string(type) + "." + std::to_string(arg));
   _action_success[agent_idx] = false;
   *agent->reward -= agent->action_failure_penalty;
 }
@@ -749,6 +765,42 @@ py::array_t<unsigned int> MettaGrid::get_agent_groups() const {
   return groups;
 }
 
+py::dict MettaGrid::get_stats_info() const {
+  py::dict info;
+
+  // Report global stats size
+  info["game_stats_keys"] = _stats->num_keys();
+
+  // Report agent stats sizes
+  size_t total_agent_keys = 0;
+  size_t max_agent_keys = 0;
+  for (const auto& agent : _agents) {
+    size_t keys = agent->stats.num_keys();
+    total_agent_keys += keys;
+    max_agent_keys = std::max(max_agent_keys, keys);
+  }
+  info["total_agent_stats_keys"] = total_agent_keys;
+  info["max_agent_stats_keys"] = max_agent_keys;
+  info["num_agents"] = _agents.size();
+
+  // Report converter stats sizes
+  size_t total_converter_keys = 0;
+  size_t num_converters = 0;
+  for (unsigned int obj_id = 1; obj_id < _grid->objects.size(); obj_id++) {
+    auto obj = _grid->object(obj_id);
+    if (!obj) continue;
+    Converter* converter = dynamic_cast<Converter*>(obj);
+    if (converter) {
+      total_converter_keys += converter->stats.num_keys();
+      num_converters++;
+    }
+  }
+  info["total_converter_stats_keys"] = total_converter_keys;
+  info["num_converters"] = num_converters;
+
+  return info;
+}
+
 // StatsTracker implementation that needs complete MettaGrid definition
 unsigned int StatsTracker::get_current_step() const {
   if (!_env) return 0;
@@ -788,5 +840,6 @@ PYBIND11_MODULE(mettagrid_c, m) {
       .def_readonly("current_step", &MettaGrid::current_step)
       .def("inventory_item_names", &MettaGrid::inventory_item_names)
       .def("get_agent_groups", &MettaGrid::get_agent_groups)
-      .def_readonly("initial_grid_hash", &MettaGrid::initial_grid_hash);
+      .def_readonly("initial_grid_hash", &MettaGrid::initial_grid_hash)
+      .def("get_stats_info", &MettaGrid::get_stats_info);
 }

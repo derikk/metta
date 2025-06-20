@@ -65,6 +65,7 @@ public:
   py::list object_type_names();
   py::list inventory_item_names();
   py::array_t<unsigned int> get_agent_groups() const;
+  py::dict get_stats_info() const;
   static Agent* create_agent(int r,
                              int c,
                              const std::string& group_name,

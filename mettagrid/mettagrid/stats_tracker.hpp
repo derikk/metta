@@ -58,7 +58,25 @@ public:
     _env = env;
   }
 
+  // Get the total number of tracked keys
+  size_t num_keys() const {
+    return _stats.size();
+  }
+
+  // Check if we should track a new key (to prevent unbounded growth)
+  bool should_track_key(const std::string& key) const {
+    // If key already exists, always track it
+    if (_stats.find(key) != _stats.end()) {
+      return true;
+    }
+    // Limit to 1000 unique keys per StatsTracker to prevent memory leaks
+    // This is a simple heuristic - in production you might want this configurable
+    const size_t MAX_KEYS = 1000;
+    return _stats.size() < MAX_KEYS;
+  }
+
   void add(const std::string& key, float amount) {
+    if (!should_track_key(key)) return;
     _stats[key] += amount;
     track_timing(key);
     track_bounds(key, _stats[key]);
@@ -70,6 +88,7 @@ public:
   }
 
   void set(const std::string& key, float value) {
+    if (!should_track_key(key)) return;
     _stats[key] = value;
     track_timing(key);
     track_bounds(key, value);
