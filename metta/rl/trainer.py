@@ -1,3 +1,4 @@
+import gc
 import logging
 import os
 import time
@@ -341,9 +342,6 @@ class MettaTrainer:
             sim_short_name = sim_name.split("/")[-1]
             self.evals[f"{category}/{sim_short_name}"] = score
 
-    def _on_train_step(self):
-        pass
-
     @with_instance_timer("_rollout")
     def _rollout(self):
         experience = self.experience
@@ -458,12 +456,12 @@ class MettaTrainer:
                     except TypeError:
                         self.stats[k] = [self.stats[k], v]  # fallback: bundle as list
 
-        # Clear GPU memory cache after rollout if using CUDA
-        if str(self.device).startswith("cuda"):
-            torch.cuda.empty_cache()
+        # Clear info dictionaries to free memory
+        raw_infos.clear()
+        infos.clear()
 
         # TODO: Better way to enable multiple collects
-        return self.stats, infos
+        return self.stats, {}
 
     @with_instance_timer("_train")
     def _train(self):
@@ -556,6 +554,9 @@ class MettaTrainer:
                 )
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
+                # Clear intermediate tensors to save memory
+                del pg_loss1, pg_loss2
+
                 # Value loss
                 newvalue_reshaped = newvalue.view(minibatch["returns"].shape)
                 if trainer_cfg.clip_vloss:
@@ -567,6 +568,7 @@ class MettaTrainer:
                     )
                     v_loss_clipped = (v_clipped - minibatch["returns"]) ** 2
                     v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                    del v_loss_unclipped, v_loss_clipped, v_clipped
                 else:
                     v_loss = 0.5 * ((newvalue_reshaped - minibatch["returns"]) ** 2).mean()
 
@@ -615,6 +617,17 @@ class MettaTrainer:
 
                 self.optimizer.zero_grad()
                 loss.backward()
+
+                # Clear intermediate tensors after backward
+                del loss, pg_loss, v_loss, entropy_loss
+                del adv, newvalue_reshaped, importance_sampling_ratio, logratio
+                if "ks_action_loss" in locals():
+                    del ks_action_loss, ks_value_loss
+                if "l2_reg_loss" in locals() and torch.is_tensor(l2_reg_loss):
+                    del l2_reg_loss
+                if "l2_init_loss" in locals() and torch.is_tensor(l2_init_loss):
+                    del l2_init_loss
+
                 if (minibatch_idx + 1) % self.experience.accumulate_minibatches == 0:
                     torch.nn.utils.clip_grad_norm_(self.policy.parameters(), trainer_cfg.max_grad_norm)
                     self.optimizer.step()
@@ -640,9 +653,9 @@ class MettaTrainer:
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
 
-        # Clear GPU memory cache after training
-        if str(self.device).startswith("cuda"):
-            torch.cuda.empty_cache()
+        # Periodic garbage collection to clean up circular references
+        if self.epoch % 10 == 0:
+            gc.collect()
 
         # Calculate explained variance
         y_pred = experience.values.flatten()
@@ -1059,6 +1072,9 @@ class MettaTrainer:
             time.sleep(5)
 
         raise RuntimeError("Failed to load policy after 10 attempts")
+
+    def _on_train_step(self):
+        pass
 
 
 class AbortingTrainer(MettaTrainer):
