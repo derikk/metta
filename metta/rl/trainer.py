@@ -32,6 +32,7 @@ from metta.sim.simulation import Simulation
 from metta.sim.simulation_config import SimulationSuiteConfig, SingleEnvSimulationConfig
 from metta.sim.simulation_suite import SimulationSuite
 from metta.util.heartbeat import record_heartbeat
+from metta.util.memory_profiler import MemoryProfiler
 from metta.util.wandb.wandb_context import WandbRun
 from mettagrid.curriculum import curriculum_from_config_path
 from mettagrid.mettagrid_env import MettaGridEnv, dtype_actions
@@ -150,6 +151,10 @@ class MettaTrainer:
         self._stats_epoch_id: UUID | None = None
         self._stats_run_id: UUID | None = None
 
+        # Memory profiler for debugging leaks
+        self.memory_profiler = MemoryProfiler() if self._master else None
+        self._last_memory_profile_epoch = 0
+
         # Optimizer
         optimizer_type = getattr(trainer_cfg.optimizer, "type", "adam")
         assert optimizer_type in ("adam", "muon"), f"Optimizer type must be 'adam' or 'muon', got {optimizer_type}"
@@ -265,6 +270,12 @@ class MettaTrainer:
             if self.epoch % trainer_cfg.checkpoint_interval == 0:
                 self._checkpoint_trainer()
 
+                # Profile memory at checkpoint intervals
+                memory_profile_interval = self.trainer_cfg.get("memory_profile_interval", 0)
+                if self.memory_profiler and memory_profile_interval > 0:
+                    profile = self.memory_profiler.profile_trainer(self)
+                    logger.info(f"\n{self.memory_profiler.format_profile(profile)}")
+
             if trainer_cfg.evaluate_interval != 0 and self.epoch % trainer_cfg.evaluate_interval == 0:
                 self._evaluate_policy()
 
@@ -343,7 +354,26 @@ class MettaTrainer:
             self.evals[f"{category}/{sim_short_name}"] = score
 
     def _on_train_step(self):
-        pass
+        """Called after each training step. Can be overridden for custom behavior."""
+        # Profile memory every N epochs if configured
+        memory_profile_interval = self.trainer_cfg.get("memory_profile_interval", 100)
+        if (
+            self.memory_profiler
+            and memory_profile_interval > 0
+            and self.epoch % memory_profile_interval == 0
+            and self.epoch != self._last_memory_profile_epoch
+        ):
+            self._last_memory_profile_epoch = self.epoch
+            profile = self.memory_profiler.profile_trainer(self)
+            logger.info(f"\n{self.memory_profiler.format_profile(profile)}")
+
+    def profile_memory(self):
+        """Manually trigger memory profiling."""
+        if self.memory_profiler:
+            profile = self.memory_profiler.profile_trainer(self)
+            logger.info(f"\n{self.memory_profiler.format_profile(profile)}")
+            return profile
+        return None
 
     @with_instance_timer("_rollout")
     def _rollout(self):

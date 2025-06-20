@@ -26,7 +26,6 @@ def main(cfg: DictConfig) -> None:
     if "trainer" not in cfg:
         cfg.trainer = {}
     cfg.trainer.memory_profile_interval = 10  # Profile every 10 epochs
-    cfg.trainer.profile_memory = True
 
     # Reduce training time for quick diagnosis
     original_timesteps = cfg.trainer.get("total_timesteps", 1000000)
