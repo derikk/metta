@@ -5,3 +5,18 @@ defaults:
 
 game:
   num_agents: 24
+
+  mab_builder:
+    room:
+      objects:
+        mine: 10
+        generator: 2
+        altar: 1
+        armory: 1
+        lasery: 1
+        block: 20
+        wall: 20
+
+        temple: 0
+        lab: 0
+        factory: 0
