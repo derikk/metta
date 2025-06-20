@@ -639,7 +639,7 @@ class MettaTrainer:
             self.lr_scheduler.step()
 
         # Periodic garbage collection to clean up circular references
-        if self.epoch % 10 == 0:
+        if self.epoch % 100 == 0:
             gc.collect()
 
         # Calculate explained variance
