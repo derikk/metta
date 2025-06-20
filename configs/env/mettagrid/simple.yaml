@@ -6,14 +6,14 @@ defaults:
 game:
   num_agents: 24
 
-  mab_builder:
+  map_builder:
     room:
       objects:
         mine: 10
         generator: 2
         altar: 1
-        armory: 1
-        lasery: 1
+        armory: 0
+        lasery: 0
         block: 20
         wall: 20
 
