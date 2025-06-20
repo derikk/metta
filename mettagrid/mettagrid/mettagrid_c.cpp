@@ -158,6 +158,7 @@ MettaGrid::MettaGrid(py::dict cfg, py::list map) {
         _grid->add_object(agent);
         agent->agent_id = _agents.size();
         agent->stats.set_environment(this);
+        // Note: Grid owns the agent via unique_ptr, _agents just holds non-owning pointers
         add_agent(agent);
         _group_sizes[group_id] += 1;
       }
@@ -186,7 +187,11 @@ MettaGrid::MettaGrid(py::dict cfg, py::list map) {
   set_buffers(observations, terminals, truncations, rewards);
 }
 
-MettaGrid::~MettaGrid() = default;
+MettaGrid::~MettaGrid() {
+  // Clear the non-owning agent pointers
+  // The actual Agent objects are owned and destroyed by _grid
+  _agents.clear();
+}
 
 void MettaGrid::init_action_handlers() {
   _num_action_handlers = _action_handlers.size();
@@ -472,7 +477,13 @@ void MettaGrid::set_buffers(const py::array_t<uint8_t, py::array::c_style>& obse
   _terminals = terminals;
   _truncations = truncations;
   _rewards = rewards;
-  _episode_rewards = py::array_t<float, py::array::c_style>({static_cast<ssize_t>(_rewards.shape(0))}, {sizeof(float)});
+
+  // Only recreate episode rewards if the size has changed
+  if (!_episode_rewards.request().ptr || _episode_rewards.shape(0) != _rewards.shape(0)) {
+    _episode_rewards =
+        py::array_t<float, py::array::c_style>({static_cast<ssize_t>(_rewards.shape(0))}, {sizeof(float)});
+  }
+
   for (size_t i = 0; i < _agents.size(); i++) {
     _agents[i]->init(&_rewards.mutable_unchecked<1>()(i));
   }
@@ -488,13 +499,16 @@ py::tuple MettaGrid::step(py::array_t<ActionType, py::array::c_style> actions) {
 
   // Handle group rewards
   bool share_rewards = false;
-  // TODO: We're creating this vector every time we step, even though reward
-  // should be sparse, and so we're unlikely to use it. We could decide to only
-  // create it if we need it, but that would increase complexity.
-  std::vector<double> group_rewards(_group_sizes.size());
+  // Only allocate the vector if we actually need it (when rewards are non-zero)
+  std::vector<double> group_rewards;
+
   for (size_t agent_idx = 0; agent_idx < _agents.size(); agent_idx++) {
     if (rewards_view(agent_idx) != 0) {
-      share_rewards = true;
+      if (!share_rewards) {
+        // First non-zero reward found, allocate the vector
+        share_rewards = true;
+        group_rewards.resize(_group_sizes.size(), 0.0);
+      }
       auto& agent = _agents[agent_idx];
       unsigned int group_id = agent->group;
       float group_reward = rewards_view(agent_idx) * _group_reward_pct[group_id];

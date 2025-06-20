@@ -92,8 +92,9 @@ private:
 
   unsigned int _num_observation_tokens;
 
-  // TODO: currently these are owned and destroyed by the grid, but we should
-  // probably move ownership here.
+  // Grid owns all Agent objects via unique_ptr.
+  // This vector holds non-owning raw pointers for fast access.
+  // These pointers are valid only while this MettaGrid instance exists.
   std::vector<Agent*> _agents;
 
   // We'd prefer to store these as more raw c-style arrays, but we need to both

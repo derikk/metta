@@ -155,6 +155,10 @@ class MettaGridEnv(PufferEnv, GymEnv):
         # Convert string array to list of strings for C++ compatibility
         # TODO: push the not-numpy-array higher up the stack, and consider pushing not-a-sparse-list lower.
         with self.timer("_initialize_c_env.make_c_env"):
+            # Clean up old C++ environment instance if it exists
+            if hasattr(self, "_c_env") and self._c_env is not None:
+                # Explicitly delete to ensure C++ destructor is called
+                del self._c_env
             self._c_env = MettaGrid(game_config.model_dump(by_alias=True, exclude_unset=True), level.grid.tolist())
 
         self._grid_env = self._c_env
