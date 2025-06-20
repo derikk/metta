@@ -76,56 +76,34 @@ class MemoryProfiler:
 
         return sizeof(obj)
 
-    def get_largest_objects(self, limit: int = 50) -> List[Tuple[str, int, str]]:
-        """Get the largest objects in memory."""
-        objects_by_type = defaultdict(lambda: {"count": 0, "total_size": 0, "examples": []})
+    def get_largest_objects(self, limit: int = 20) -> List[Tuple[str, int, str]]:
+        """Get the largest objects in memory, optimized for speed."""
+        objects_by_type = defaultdict(lambda: {"count": 0, "total_size": 0})
 
-        # Track wandb-specific objects
-        wandb_objects = defaultdict(lambda: {"count": 0, "total_size": 0})
+        # Avoid iterating over all objects if possible
+        gc.collect()
+        all_objects = gc.get_objects()
 
-        for obj in gc.get_objects():
+        # Focus on potentially large object types first
+        large_types = (list, dict, set, tuple, np.ndarray, torch.Tensor)
+
+        for obj in all_objects:
+            # Skip small objects quickly
+            if not isinstance(obj, large_types) and sys.getsizeof(obj) < 1024:
+                continue
+
             try:
                 obj_type = type(obj).__name__
                 obj_module = type(obj).__module__
-                full_type = f"{obj_module}.{obj_type}" if obj_module else obj_type
+                full_type = f"{obj_module}.{obj_type}"
 
-                # Track wandb objects separately
-                if obj_module and "wandb" in obj_module:
-                    size = self._get_object_size(obj)
-                    wandb_objects[full_type]["count"] += 1
-                    wandb_objects[full_type]["total_size"] += size
+                size = self._get_object_size(obj)
 
-                # Special handling for different object types
-                if isinstance(obj, (list, dict, set, tuple)):
-                    size = self._get_object_size(obj)
-                    if size > 1024 * 1024:  # Only track containers > 1MB
-                        objects_by_type[f"{full_type}(len={len(obj)})"]["count"] += 1
-                        objects_by_type[f"{full_type}(len={len(obj)})"]["total_size"] += size
-                        if len(objects_by_type[f"{full_type}(len={len(obj)})"]["examples"]) < 3:
-                            objects_by_type[f"{full_type}(len={len(obj)})"]["examples"].append(str(obj)[:100])
-                elif isinstance(obj, np.ndarray):
-                    size = obj.nbytes
-                    shape_str = f"shape={obj.shape},dtype={obj.dtype}"
-                    objects_by_type[f"numpy.ndarray({shape_str})"]["count"] += 1
-                    objects_by_type[f"numpy.ndarray({shape_str})"]["total_size"] += size
-                elif torch.is_tensor(obj):
-                    size = obj.element_size() * obj.nelement()
-                    shape_str = f"shape={list(obj.shape)},dtype={obj.dtype},device={obj.device}"
-                    objects_by_type[f"torch.Tensor({shape_str})"]["count"] += 1
-                    objects_by_type[f"torch.Tensor({shape_str})"]["total_size"] += size
-                else:
-                    size = sys.getsizeof(obj)
-                    if size > 1024 * 1024:  # Only track objects > 1MB
-                        objects_by_type[full_type]["count"] += 1
-                        objects_by_type[full_type]["total_size"] += size
+                if size > 1024:  # Only track objects > 1KB
+                    objects_by_type[full_type]["count"] += 1
+                    objects_by_type[full_type]["total_size"] += size
             except:
                 pass
-
-        # Add wandb objects to the main list
-        for wandb_type, stats in wandb_objects.items():
-            if stats["total_size"] > 0:
-                objects_by_type[f"[WANDB] {wandb_type}"]["count"] = stats["count"]
-                objects_by_type[f"[WANDB] {wandb_type}"]["total_size"] = stats["total_size"]
 
         # Sort by total size
         sorted_types = sorted(

@@ -270,12 +270,6 @@ class MettaTrainer:
             if self.epoch % trainer_cfg.checkpoint_interval == 0:
                 self._checkpoint_trainer()
 
-                # Profile memory at checkpoint intervals
-                memory_profile_interval = self.trainer_cfg.get("memory_profile_interval", 0)
-                if self.memory_profiler and memory_profile_interval > 0:
-                    profile = self.memory_profiler.profile_trainer(self)
-                    logger.info(f"\n{self.memory_profiler.format_profile(profile)}")
-
             if trainer_cfg.evaluate_interval != 0 and self.epoch % trainer_cfg.evaluate_interval == 0:
                 self._evaluate_policy()
 
