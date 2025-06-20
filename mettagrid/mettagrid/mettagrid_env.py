@@ -161,7 +161,7 @@ class MettaGridEnv(PufferEnv, GymEnv):
                 del self._c_env
             self._c_env = MettaGrid(game_config.model_dump(by_alias=True, exclude_unset=True), level.grid.tolist())
 
-        self._grid_env = self._c_env
+        # Note: _grid_env reference removed to avoid circular reference issues
 
     @override  # pufferlib.PufferEnv.reset
     @with_instance_timer("reset")

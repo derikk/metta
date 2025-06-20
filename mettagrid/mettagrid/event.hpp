@@ -82,6 +82,14 @@ public:
       this->event_handlers[event.event_type]->handle_event(event.object_id, event.arg);
     }
   }
+
+  void clear_events() {
+    // Clear all pending events - useful when resetting or destroying the environment
+    while (!_event_queue.empty()) {
+      _event_queue.pop();
+    }
+    _current_timestep = 0;
+  }
 };
 
 #endif  // METTAGRID_METTAGRID_EVENT_HPP_

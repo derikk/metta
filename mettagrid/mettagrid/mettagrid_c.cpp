@@ -188,9 +188,21 @@ MettaGrid::MettaGrid(py::dict cfg, py::list map) {
 }
 
 MettaGrid::~MettaGrid() {
+  // Clear any pending events
+  if (_event_manager) {
+    _event_manager->clear_events();
+  }
+
   // Clear the non-owning agent pointers
   // The actual Agent objects are owned and destroyed by _grid
   _agents.clear();
+
+  // Explicitly release Python buffer references
+  _observations = py::array_t<uint8_t>();
+  _terminals = py::array_t<bool>();
+  _truncations = py::array_t<bool>();
+  _rewards = py::array_t<float>();
+  _episode_rewards = py::array_t<float>();
 }
 
 void MettaGrid::init_action_handlers() {
