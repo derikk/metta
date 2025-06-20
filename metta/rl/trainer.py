@@ -396,7 +396,7 @@ class MettaTrainer:
                 # Store LSTM state for performance
                 lstm_state_to_store = None
                 if state.lstm_h is not None:
-                    lstm_state_to_store = {"lstm_h": state.lstm_h, "lstm_c": state.lstm_c}
+                    lstm_state_to_store = {"lstm_h": state.lstm_h.detach(), "lstm_c": state.lstm_c.detach()}
 
                 if str(self.device).startswith("cuda"):
                     torch.cuda.synchronize()
@@ -437,6 +437,9 @@ class MettaTrainer:
         # Batch process info dictionaries after rollout
         for i in raw_infos:
             for k, v in unroll_nested_dict(i):
+                # Convert any tensors to Python scalars to avoid memory leaks
+                if torch.is_tensor(v):
+                    v = v.item() if v.numel() == 1 else v.tolist()
                 infos[k].append(v)
 
         # Batch process stats more efficiently
@@ -454,6 +457,10 @@ class MettaTrainer:
                         self.stats[k] += v
                     except TypeError:
                         self.stats[k] = [self.stats[k], v]  # fallback: bundle as list
+
+        # Clear GPU memory cache after rollout if using CUDA
+        if str(self.device).startswith("cuda"):
+            torch.cuda.empty_cache()
 
         # TODO: Better way to enable multiple collects
         return self.stats, infos
@@ -632,6 +639,10 @@ class MettaTrainer:
 
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
+
+        # Clear GPU memory cache after training
+        if str(self.device).startswith("cuda"):
+            torch.cuda.empty_cache()
 
         # Calculate explained variance
         y_pred = experience.values.flatten()
