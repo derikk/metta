@@ -1,10 +1,7 @@
 sampling: 0
 desync_episodes: false
-<<<<<<< HEAD
 replay_level_prob: 0
-=======
-replay_level_prob: 0.2
->>>>>>> origin/main
+
 game:
   num_agents: ???
   obs_width: 11
@@ -196,7 +193,7 @@ game:
 
   actions:
     noop:
-    enabled: true
+      enabled: true
     move:
       enabled: true
     rotate:
