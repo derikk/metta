@@ -19,9 +19,6 @@ private:
   std::map<std::string, int> _update_count;
   MettaGrid* _env;
 
-  // Limit stats to prevent memory leaks from unbounded key growth
-  static constexpr size_t MAX_STATS_KEYS = 10000;
-
   // Track timing for any update
   void track_timing(const std::string& key) {
     if (_env) {
@@ -62,11 +59,6 @@ public:
   }
 
   void add(const std::string& key, float amount) {
-    // Prevent unbounded growth by checking map size
-    if (_stats.find(key) == _stats.end() && _stats.size() >= MAX_STATS_KEYS) {
-      // Skip adding new keys when we're at the limit
-      return;
-    }
     _stats[key] += amount;
     track_timing(key);
     track_bounds(key, _stats[key]);
@@ -78,11 +70,6 @@ public:
   }
 
   void set(const std::string& key, float value) {
-    // Prevent unbounded growth by checking map size
-    if (_stats.find(key) == _stats.end() && _stats.size() >= MAX_STATS_KEYS) {
-      // Skip adding new keys when we're at the limit
-      return;
-    }
     _stats[key] = value;
     track_timing(key);
     track_bounds(key, value);

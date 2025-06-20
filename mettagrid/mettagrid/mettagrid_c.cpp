@@ -406,24 +406,6 @@ py::tuple MettaGrid::reset() {
   auto obs_size = _observations.size();
   std::fill(obs_ptr, obs_ptr + obs_size, EmptyTokenByte);
 
-  // Reset stats to prevent memory accumulation
-  _stats->reset();
-
-  // Reset all agent stats
-  for (const auto& agent : _agents) {
-    agent->stats.reset();
-  }
-
-  // Reset all converter stats
-  for (unsigned int obj_id = 1; obj_id < _grid->objects.size(); obj_id++) {
-    auto obj = _grid->object(obj_id);
-    if (!obj) continue;
-    Converter* converter = dynamic_cast<Converter*>(obj);
-    if (converter) {
-      converter->stats.reset();
-    }
-  }
-
   // Compute initial observations
   std::vector<ssize_t> shape = {static_cast<ssize_t>(_agents.size()), static_cast<ssize_t>(2)};
   auto zero_actions = py::array_t<int>(shape);
@@ -481,18 +463,7 @@ void MettaGrid::set_buffers(const py::array_t<uint8_t, py::array::c_style>& obse
   _terminals = terminals;
   _truncations = truncations;
   _rewards = rewards;
-
-  // Only allocate _episode_rewards if it doesn't exist or has wrong size
-  ssize_t expected_size = _rewards.shape(0);
-  if (_episode_rewards.size() != expected_size) {
-    _episode_rewards = py::array_t<float, py::array::c_style>({expected_size}, {sizeof(float)});
-  }
-
-  // Clear existing episode rewards
-  std::fill(static_cast<float*>(_episode_rewards.request().ptr),
-            static_cast<float*>(_episode_rewards.request().ptr) + _episode_rewards.size(),
-            0.0f);
-
+  _episode_rewards = py::array_t<float, py::array::c_style>({static_cast<ssize_t>(_rewards.shape(0))}, {sizeof(float)});
   for (size_t i = 0; i < _agents.size(); i++) {
     _agents[i]->init(&_rewards.mutable_unchecked<1>()(i));
   }
@@ -508,28 +479,22 @@ py::tuple MettaGrid::step(py::array_t<ActionType, py::array::c_style> actions) {
 
   // Handle group rewards
   bool share_rewards = false;
-  // Check if we need to share rewards first
+  // TODO: We're creating this vector every time we step, even though reward
+  // should be sparse, and so we're unlikely to use it. We could decide to only
+  // create it if we need it, but that would increase complexity.
+  std::vector<double> group_rewards(_group_sizes.size());
   for (size_t agent_idx = 0; agent_idx < _agents.size(); agent_idx++) {
     if (rewards_view(agent_idx) != 0) {
       share_rewards = true;
-      break;
+      auto& agent = _agents[agent_idx];
+      unsigned int group_id = agent->group;
+      float group_reward = rewards_view(agent_idx) * _group_reward_pct[group_id];
+      rewards_view(agent_idx) -= group_reward;
+      group_rewards[group_id] += group_reward / _group_sizes[group_id];
     }
   }
 
   if (share_rewards) {
-    // Only allocate when we actually need to share rewards
-    std::vector<double> group_rewards(_group_sizes.size());
-
-    for (size_t agent_idx = 0; agent_idx < _agents.size(); agent_idx++) {
-      if (rewards_view(agent_idx) != 0) {
-        auto& agent = _agents[agent_idx];
-        unsigned int group_id = agent->group;
-        float group_reward = rewards_view(agent_idx) * _group_reward_pct[group_id];
-        rewards_view(agent_idx) -= group_reward;
-        group_rewards[group_id] += group_reward / _group_sizes[group_id];
-      }
-    }
-
     for (size_t agent_idx = 0; agent_idx < _agents.size(); agent_idx++) {
       auto& agent = _agents[agent_idx];
       unsigned int group_id = agent->group;
