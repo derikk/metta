@@ -1,4 +1,3 @@
-
 export type HeatmapCell = {
   evalName: string;
   replayUrl: string | null;
@@ -20,6 +19,26 @@ export type HeatmapData = {
   evalMaxScores: Record<string, number>;
 }
 
+export type TokenInfo = {
+  id: string;
+  name: string;
+  created_at: string;
+  expiration_time: string;
+  last_used_at: string | null;
+}
+
+export type TokenCreate = {
+  name: string;
+}
+
+export type TokenResponse = {
+  token: string;
+}
+
+export type TokenListResponse = {
+  tokens: TokenInfo[];
+}
+
 /**
  * Interface for data fetching.
  *
@@ -32,14 +51,32 @@ export interface Repo {
   getGroupIds(suite: string): Promise<string[]>;
 
   getHeatmapData(metric: string, suite: string, groupMetric: GroupHeatmapMetric): Promise<HeatmapData>;
+
+  // Token management methods
+  createToken(tokenData: TokenCreate): Promise<TokenResponse>;
+  listTokens(): Promise<TokenListResponse>;
+  deleteToken(tokenId: string): Promise<void>;
 }
 
 export class ServerRepo implements Repo {
   constructor(private baseUrl: string = "http://localhost:8000") {
   }
 
+  private getHeaders(): Record<string, string> {
+    const headers: Record<string, string> = {};
+
+    // Add dev auth header when running locally
+    if (this.baseUrl.includes('localhost') || this.baseUrl.includes('127.0.0.1')) {
+      headers['X-Auth-Request-Email'] = 'dev@stem.ai';
+    }
+
+    return headers;
+  }
+
   private async apiCall<T>(endpoint: string): Promise<T> {
-    const response = await fetch(`${this.baseUrl}${endpoint}`);
+    const response = await fetch(`${this.baseUrl}${endpoint}`, {
+      headers: this.getHeaders(),
+    });
     if (!response.ok) {
       throw new Error(`API call failed: ${response.status} ${response.statusText}`);
     }
@@ -51,6 +88,7 @@ export class ServerRepo implements Repo {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        ...this.getHeaders(),
       },
       body: JSON.stringify(body),
     });
@@ -58,6 +96,16 @@ export class ServerRepo implements Repo {
       throw new Error(`API call failed: ${response.status} ${response.statusText}`);
     }
     return response.json();
+  }
+
+  private async apiCallDelete(endpoint: string): Promise<void> {
+    const response = await fetch(`${this.baseUrl}${endpoint}`, {
+      method: 'DELETE',
+      headers: this.getHeaders(),
+    });
+    if (!response.ok) {
+      throw new Error(`API call failed: ${response.status} ${response.statusText}`);
+    }
   }
 
   async getSuites(): Promise<string[]> {
@@ -79,6 +127,19 @@ export class ServerRepo implements Repo {
       { group_metric: groupMetric }
     );
     return apiData;
+  }
+
+  // Token management methods
+  async createToken(tokenData: TokenCreate): Promise<TokenResponse> {
+    return this.apiCallWithBody<TokenResponse>("/tokens", tokenData);
+  }
+
+  async listTokens(): Promise<TokenListResponse> {
+    return this.apiCall<TokenListResponse>("/tokens");
+  }
+
+  async deleteToken(tokenId: string): Promise<void> {
+    return this.apiCallDelete(`/tokens/${tokenId}`);
   }
 }
 
