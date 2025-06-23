@@ -18,6 +18,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 
 from app_backend.stats_client import StatsClient
+from metta.agent.llm_policy_adapter import create_llm_policy_record
 from metta.agent.policy_store import PolicyStore
 from metta.sim.simulation_config import SimulationSuiteConfig
 from metta.sim.simulation_suite import SimulationSuite
@@ -25,6 +26,7 @@ from metta.util.config import Config
 from metta.util.logging import setup_mettagrid_logger
 from metta.util.runtime_configuration import setup_mettagrid_environment
 from metta.util.stats_client_cfg import get_stats_client
+from mettagrid.curriculum import SamplingCurriculum
 
 # --------------------------------------------------------------------------- #
 # Config objects                                                              #
@@ -39,6 +41,7 @@ class SimJob(Config):
     stats_db_uri: str
     stats_dir: str  # The (local) directory where stats should be stored
     replay_dir: str  # where to store replays
+    use_llm_agent: bool = False  # New flag for using LLM agent
 
 
 # --------------------------------------------------------------------------- #
@@ -63,9 +66,31 @@ def simulate_policy(
     results = {"policy_uri": policy_uri, "checkpoints": []}
 
     policy_store = PolicyStore(cfg, None)
-    # TODO: institutionalize this better?
-    metric = sim_job.simulation_suite.name + "_score"
-    policy_prs = policy_store.policies(policy_uri, sim_job.selector_type, n=1, metric=metric)
+
+    # Handle LLM agent case
+    if sim_job.use_llm_agent:
+        # Create a dummy environment to initialize the LLM agent
+        # We need to use the first simulation's config to create the env
+        first_sim_name = list(sim_job.simulation_suite.simulations.keys())[0]
+        first_sim_config = sim_job.simulation_suite.simulations[first_sim_name]
+
+        # Create curriculum and environment for LLM agent initialization
+        curriculum = SamplingCurriculum(first_sim_config.env, first_sim_config.env_overrides)
+        env_cfg = curriculum.get_task().env_cfg()
+
+        # Import here to avoid circular imports
+        from mettagrid.mettagrid_env import MettaGridEnv
+
+        env = MettaGridEnv(curriculum, render_mode=None)
+
+        # Create LLM policy record
+        policy_pr = create_llm_policy_record(policy_store, env, "llm_agent")
+        policy_prs = [policy_pr]
+        logger.info("Created LLM agent policy")
+    else:
+        # Original behavior for regular policy URIs
+        metric = sim_job.simulation_suite.name + "_score"
+        policy_prs = policy_store.policies(policy_uri, sim_job.selector_type, n=1, metric=metric)
 
     stats_client: StatsClient | None = get_stats_client(cfg, logger)
 
@@ -120,11 +145,22 @@ def main(cfg: DictConfig) -> None:
 
     sim_job = SimJob(cfg.sim_job)
 
+    # Check for command line override of use_llm_agent
+    if hasattr(cfg, "use_llm_agent") and cfg.use_llm_agent:
+        sim_job.use_llm_agent = True
+        logger.info("Using LLM agent (override from command line)")
+
     all_results = {"simulation_suite": sim_job.simulation_suite.name, "policies": []}
 
-    for policy_uri in sim_job.policy_uris:
-        policy_results = simulate_policy(sim_job, policy_uri, cfg, logger)
+    if sim_job.use_llm_agent:
+        # For LLM agent, we only have one "policy" to evaluate
+        policy_results = simulate_policy(sim_job, "llm://llm_agent", cfg, logger)
         all_results["policies"].append(policy_results)
+    else:
+        # Original behavior for policy URIs
+        for policy_uri in sim_job.policy_uris:
+            policy_results = simulate_policy(sim_job, policy_uri, cfg, logger)
+            all_results["policies"].append(policy_results)
 
     # Always output JSON results to stdout
     # Ensure all logging is flushed before printing JSON
